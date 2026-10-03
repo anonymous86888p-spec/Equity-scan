@@ -59,7 +59,7 @@ function norm(symbol, raw) {
     symbol, companyName: info.companyName || null, sector: info.industry || null, currentPrice: price,
     previousClose: num(pi.previousClose), change: num(pi.change), percentChange: num(pi.pChange),
     open: num(pi.open), dayHigh: num(id.max), dayLow: num(id.min), week52High: hi, week52Low: lo,
-    volume: num(pi.totalTradedVolume), lastUpdated: pi.lastUpdateTime || null,
+    volume: num(pi.totalTradedVolume) ?? num(raw.marketDeptOrderBook && raw.marketDeptOrderBook.tradeInfo && raw.marketDeptOrderBook.tradeInfo.totalTradedVolume) ?? num(raw.securityInfo && raw.securityInfo.totalTradedVolume), lastUpdated: pi.lastUpdateTime || null,
     highPercent: price !== null && hi ? Number(((price / hi) * 100).toFixed(2)) : null,
     dataStatus: have === 3 ? "COMPLETE" : have === 0 ? "UNAVAILABLE" : "PARTIAL",
   };
@@ -97,12 +97,14 @@ async function loadIndex(name) {
     : nse.getDataByEndpoint("/api/equity-stockIndices?index=" + encodeURIComponent(name));
   const raw = await tmo(call, Math.max(C.timeout, 25000));
   const arr = raw && Array.isArray(raw.data) ? raw.data : null;
-  if (!arr) throw fail("INVALID_PROVIDER_RESPONSE", "Index response had no data.", 502);
+  if (!arr) throw fail("INVALID_PROVIDER_RESPONSE", "Index response had no data (keys: " + Object.keys(raw || {}).slice(0, 6).join(",") + ").", 502);
   const syms = [];
   for (const it of arr) {
-    if (!it || !it.symbol || it.priority === 1 || it.symbol === raw.name) continue;
+    const meta = (it && it.meta) || {}, sym = it && (it.symbol || meta.symbol);
+    if (!sym || sym === raw.name || sym === name || (it.priority === 1 && !meta.companyName)) continue;
+    it.symbol = sym;
     const price = num(it.lastPrice), hi = num(it.yearHigh), lo = num(it.yearLow);
-    const k = "s:" + it.symbol, old = stale(k) || {}, meta = it.meta || {};
+    const k = "s:" + it.symbol, old = stale(k) || {};
     const got = [price, hi, lo].filter((x) => x !== null).length;
     cset(k, {
       symbol: it.symbol, companyName: meta.companyName || old.companyName || null, sector: meta.industry || old.sector || null,
@@ -114,7 +116,7 @@ async function loadIndex(name) {
     }, C.ttl);
     syms.push(it.symbol);
   }
-  if (!syms.length) throw fail("INVALID_PROVIDER_RESPONSE", "Index had no stocks.", 502);
+  if (!syms.length) throw fail("INVALID_PROVIDER_RESPONSE", "Index had no stocks (rows: " + arr.length + ", keys: " + Object.keys(arr[1] || arr[0] || {}).slice(0, 8).join(",") + ").", 502);
   universe = syms; nseBudget.spend();
   return syms.length;
 }
@@ -140,7 +142,8 @@ async function yahooClient() {
   yfClient = typeof Y === "function" ? new Y({ suppressNotices: ["yahooSurvey"] }) : Y;
   return yfClient;
 }
-async function loadYahoo() {
+let yfQuoteFailAt = 0;
+async function loadYahooQuotes() {
   const yf = await yahooClient();
   const syms = [...new Set([...YF_LIST, ...universe])].slice(0, 600);
   let ok = 0;
@@ -167,6 +170,48 @@ async function loadYahoo() {
   if (!ok) throw fail("PROVIDER_UNAVAILABLE", "Yahoo returned no quotes.", 503);
   return ok;
 }
+const YH = { "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Mobile Safari/537.36", Accept: "application/json" };
+async function yahooChartRaw(sym, range, interval) {
+  const ac = new AbortController(), t = setTimeout(() => ac.abort(), 15000);
+  try {
+    const r = await fetch("https://query1.finance.yahoo.com/v8/finance/chart/" + encodeURIComponent(sym) + ".NS?range=" + range + "&interval=" + interval, { headers: YH, signal: ac.signal });
+    if (!r.ok) throw fail("PROVIDER_UNAVAILABLE", "Yahoo returned " + r.status, 503);
+    const res = (((await r.json()) || {}).chart || {}).result;
+    if (!res || !res[0]) throw fail("PROVIDER_UNAVAILABLE", "Yahoo had no data for " + sym, 503);
+    return res[0];
+  } catch (e) { throw e && e.code ? e : fail("PROVIDER_UNAVAILABLE", "Yahoo: " + String((e && e.message) || e).slice(0, 100), 503); }
+  finally { clearTimeout(t); }
+}
+async function loadYahooMeta() {
+  const syms = [...new Set(YF_LIST)];
+  let ok = 0, lastErr = null;
+  await pool(syms, 6, async (sym) => {
+    try {
+      const m = (await yahooChartRaw(sym, "1d", "1d")).meta || {};
+      const price = num(m.regularMarketPrice), prev = num(m.chartPreviousClose ?? m.previousClose), hi = num(m.fiftyTwoWeekHigh), lo = num(m.fiftyTwoWeekLow);
+      if (price === null) return;
+      const got = [price, hi, lo].filter((x) => x !== null).length, ch = prev ? price - prev : null;
+      cset("y:" + sym, {
+        symbol: sym, companyName: m.longName || m.shortName || null, sector: null, currentPrice: price, previousClose: prev,
+        change: ch === null ? null : Number(ch.toFixed(2)), percentChange: ch === null ? null : Number(((ch / prev) * 100).toFixed(2)),
+        open: null, dayHigh: num(m.regularMarketDayHigh), dayLow: num(m.regularMarketDayLow), week52High: hi, week52Low: lo,
+        volume: num(m.regularMarketVolume), lastUpdated: m.regularMarketTime ? new Date(Number(m.regularMarketTime) * 1000).toISOString() : null,
+        marketCap: null, pe: null, highPercent: hi ? Number(((price / hi) * 100).toFixed(2)) : null,
+        dataStatus: got === 3 ? "COMPLETE" : got === 0 ? "UNAVAILABLE" : "PARTIAL",
+      }, C.ttl);
+      yahooSyms.add(sym); ok++;
+    } catch (e) { lastErr = e; }
+  });
+  if (!ok) throw fail("PROVIDER_UNAVAILABLE", (lastErr && lastErr.message) || "Yahoo returned no quotes.", 503);
+  return ok;
+}
+async function loadYahoo() {
+  if (Date.now() - yfQuoteFailAt > 30 * 60000) {
+    try { return await loadYahooQuotes(); }
+    catch (e) { yfQuoteFailAt = Date.now(); console.warn("[EquityScan] Yahoo batch (crumb) failed, using chart fallback:", String((e && e.message) || e).slice(0, 100)); }
+  }
+  return loadYahooMeta();
+}
 function refreshYahoo() {
   if (yahooRun || Date.now() - yahooTry < 30000 || Date.now() - yahooAt < C.ttl) return yahooRun;
   yahooTry = Date.now();
@@ -176,12 +221,15 @@ function refreshYahoo() {
   return yahooRun;
 }
 async function yahooChart(sym, range) {
-  const yf = await yahooClient(), now = Date.now();
-  const opts = range === "1d" ? { period1: new Date(now - 5 * 864e5), interval: "5m" } : { period1: new Date(now - { "1m": 31, "6m": 183, "1y": 366 }[range] * 864e5), interval: "1d" };
-  const res = await tmo(yf.chart(sym + ".NS", opts, { validateResult: false }), 25000);
-  let pts = ((res && res.quotes) || []).filter((r) => r && r.close != null && r.date)
-    .map((r) => (range === "1d" ? [new Date(r.date).getTime() + 19800000, Number(r.close)] : [new Date(r.date).getTime(), Number(r.close), Number(r.volume) || 0]));
-  if (range === "1d" && pts.length) { const day = Math.floor(pts[pts.length - 1][0] / 864e5); pts = pts.filter((x) => Math.floor(x[0] / 864e5) === day); }
+  const cfg = { "1d": ["1d", "5m"], "1m": ["1mo", "1d"], "6m": ["6mo", "1d"], "1y": ["1y", "1d"] }[range];
+  const res = await yahooChartRaw(sym, cfg[0], cfg[1]);
+  const ts = res.timestamp || [], q = (res.indicators && res.indicators.quote && res.indicators.quote[0]) || {};
+  const pts = [];
+  ts.forEach((t, i) => {
+    const c = q.close && q.close[i];
+    if (c == null) return;
+    pts.push(range === "1d" ? [t * 1000 + 19800000, Number(c)] : [t * 1000, Number(c), Number((q.volume && q.volume[i]) || 0)]);
+  });
   if (!pts.length) throw fail("PROVIDER_UNAVAILABLE", "No Yahoo chart data.", 503);
   return pts;
 }
@@ -326,11 +374,11 @@ app.get("/api/debug/nse", h(async (q) => {
     out.index = { ok: true, name: C.index, ms: Date.now() - t, count: Array.isArray(r && r.data) ? r.data.length : null, sampleKeys: r && r.data && r.data[1] ? Object.keys(r.data[1]) : null, hasGetter: typeof nse.getEquityStockIndices === "function" };
   } catch (e) { out.index = { ...fmt(e), ms: Date.now() - t, name: C.index }; }
   t = Date.now();
-  try {
-    const yq = await tmo((await yahooClient()).quote([sym + ".NS"], {}, { validateResult: false }), 20000);
-    const q0 = Array.isArray(yq) ? yq[0] : yq;
-    out.yahoo = { ok: !!q0, ms: Date.now() - t, price: q0 ? q0.regularMarketPrice : null, marketCap: q0 ? q0.marketCap : null, pe: q0 ? q0.trailingPE : null };
-  } catch (e) { out.yahoo = { ...fmt(e), ms: Date.now() - t }; }
+  try { const m = (await yahooChartRaw(sym, "1d", "1d")).meta || {}; out.yahooChart = { ok: true, ms: Date.now() - t, price: m.regularMarketPrice, volume: m.regularMarketVolume }; }
+  catch (e) { out.yahooChart = { ...fmt(e), ms: Date.now() - t }; }
+  t = Date.now();
+  try { const yq = await tmo((await yahooClient()).quote([sym + ".NS"], {}, { validateResult: false }), 20000); const q0 = Array.isArray(yq) ? yq[0] : yq; out.yahooQuote = { ok: !!q0, ms: Date.now() - t, marketCap: q0 ? q0.marketCap : null, pe: q0 ? q0.trailingPE : null }; }
+  catch (e) { out.yahooQuote = { ...fmt(e), ms: Date.now() - t }; }
   out.yahooSymbols = yahooSyms.size; out.yahooError = yahooError;
   out.universeSize = universe.length;
   out.lastNseError = lastNseError; out.nseBudgetUsed = nseBudget.u;
