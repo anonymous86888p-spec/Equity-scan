@@ -8,8 +8,8 @@ const { NseIndia } = require("stock-nse-india");
 /* ---------- CONFIG ---------- */
 const env = (k, d) => { const v = process.env[k]; const n = Number(v); return v && Number.isFinite(n) ? n : d; };
 const C = {
-  port: env("PORT", 3000), ttl: env("QUOTE_CACHE_TTL", 300000), conc: env("MAX_CONCURRENCY", 4),
-  refresh: env("REFRESH_INTERVAL_MS", 900000), groqKey: process.env.GROQ_API_KEY || null,
+  port: env("PORT", 3000), ttl: env("QUOTE_CACHE_TTL", 240000), conc: env("MAX_CONCURRENCY", 6),
+  refresh: env("REFRESH_INTERVAL_MS", 240000), groqKey: process.env.GROQ_API_KEY || null,
   model: process.env.GROQ_MODEL || "openai/gpt-oss-120b",
   U: ["TCS","RELIANCE","HDFCBANK","INFY","ICICIBANK","BHARTIARTL","SBIN","ITC","LT","KOTAKBANK","HINDUNILVR","AXISBANK","BAJFINANCE","MARUTI","ASIANPAINT","WIPRO","TITAN","SUNPHARMA","NTPC","ADANIENT","ULTRACEMCO","POWERGRID","NESTLEIND","TATAMOTORS","JSWSTEEL"],
 };
@@ -25,7 +25,7 @@ Budget.prototype.can = function () { if (this.d !== ist()) { this.d = ist(); thi
 Budget.prototype.spend = function () {
   this.u++; try { fs.writeFileSync(this.f, JSON.stringify({ date: this.d, used: this.u })); } catch (e) {}
 };
-const nseBudget = new Budget(".budget-state.json", env("DAILY_CALL_BUDGET", 50));
+const nseBudget = new Budget(".budget-state.json", env("DAILY_CALL_BUDGET", 2500));
 const aiBudget = new Budget(".groq-budget-state.json", env("GROQ_DAILY_BUDGET", 500));
 
 /* ---------- CACHE (TTL + in-flight dedupe + stale reads) ---------- */
@@ -71,8 +71,8 @@ async function getStock(sym) {
     const old = stale(k);
     if (!nseBudget.can()) { if (old) return { ...old, source: "stale" }; throw fail("RATE_LIMITED", "Daily NSE call budget used up and nothing cached yet.", 429); }
     let raw, err;
-    for (let i = 0; i <= 2 && !raw; i++) {
-      try { raw = await tmo(nse.getEquityDetails(sym), 10000); }
+    for (let i = 0; i <= 1 && !raw; i++) {
+      try { raw = await tmo(nse.getEquityDetails(sym), 7000); }
       catch (e) {
         err = e;
         lastNseError = { at: new Date().toISOString(), symbol: sym, status: (e && e.response && e.response.status) || null, message: String((e && e.message) || e).slice(0, 200) };
@@ -87,7 +87,23 @@ async function getStock(sym) {
     cset(k, v, C.ttl); return { ...v, source: "provider" };
   });
 }
-const allStocks = async () => (await pool(C.U, C.conc, (s) => getStock(s).catch(() => null))).filter(Boolean);
+/* Stale-while-revalidate: always answer instantly from cache; refresh in the background. */
+let bg = null, lastBg = 0;
+function refreshStale() {
+  if (bg || Date.now() - lastBg < 20000) return bg;
+  const need = C.U.filter((x) => !cget("s:" + x));
+  if (!need.length) return null;
+  lastBg = Date.now();
+  bg = pool(need, C.conc, (x) => getStock(x).catch(() => null)).finally(() => { bg = null; });
+  return bg;
+}
+const have = () => C.U.map((x) => { const f = cget("s:" + x); const v = f || stale("s:" + x); return v ? { ...v, source: f ? "cache" : "stale" } : null; }).filter(Boolean);
+async function allStocks() {
+  let rows = have();
+  const p = refreshStale();
+  if (p && rows.length < C.U.length / 2) { await Promise.race([p, sleep(10000)]); rows = have(); }
+  return rows;
+}
 
 async function marketStatus() {
   const k = "market", f = cget(k); if (f) return f;
@@ -194,10 +210,16 @@ app.get("/api/debug/nse", h(async (q) => {
   return out;
 }));
 app.get("/api/market-status", h(marketStatus));
-app.get("/api/stocks", h(async () => ({ rows: await allStocks() })));
+app.get("/api/stocks", h(async () => {
+  refreshStale();
+  const rows = have();
+  return { rows, loading: C.U.length - rows.length, total: C.U.length, error: rows.length ? null : lastNseError };
+}));
 app.get("/api/stock/:symbol", h(async (q) => {
   const sym = String(q.params.symbol || "").trim().toUpperCase();
   if (!/^[A-Z0-9&-]{1,20}$/.test(sym)) throw fail("INVALID_SYMBOL", '"' + sym + '" is not a valid NSE symbol.', 400);
+  const k = "s:" + sym, f = cget(k), st = f || stale(k);
+  if (st) { if (!f) getStock(sym).catch(() => {}); return { ...st, source: f ? "cache" : "stale" }; }
   return getStock(sym);
 }));
 app.post("/api/query", h(async (q) => {
@@ -220,19 +242,19 @@ const HTML = String.raw`<!doctype html><html lang="en"><head><meta charset="utf-
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>EquityScan</title>
 <style>
 :root{--g:#2ee6a6;--r:#ff6b81;--t:#eaf6ff;--m:#9db8cc}
+html{background:#061a2e}
 *{box-sizing:border-box;margin:0}
-body{font:15px system-ui,-apple-system,sans-serif;color:var(--t);background:linear-gradient(160deg,#061a2e,#0b3b4f 60%,#0a5560);background-attachment:fixed;min-height:100vh;padding-bottom:110px;overflow-x:hidden}
-.blob{position:fixed;border-radius:50%;filter:blur(70px);opacity:.4;z-index:0;animation:fl 16s ease-in-out infinite alternate}
-@keyframes fl{to{transform:translate(70px,-90px) scale(1.25)}}
-#fx{position:fixed;inset:0;z-index:1;pointer-events:none}
+body{font:15px system-ui,-apple-system,sans-serif;color:var(--t);background:linear-gradient(160deg,#061a2e,#0b3b4f 60%,#0a5560);min-height:100vh;padding-bottom:110px;overflow-x:hidden}
 #app{position:relative;z-index:2;max-width:760px;margin:0 auto;padding:env(safe-area-inset-top) 14px 0}
-.glass{background:rgba(255,255,255,.09);-webkit-backdrop-filter:blur(18px);backdrop-filter:blur(18px);border:1px solid rgba(255,255,255,.18);border-radius:22px;box-shadow:inset 0 1px 0 rgba(255,255,255,.25),0 8px 30px rgba(0,0,0,.25)}
+.glass{background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.14);border-radius:22px;box-shadow:inset 0 1px 0 rgba(255,255,255,.18)}
+header.glass,#tabs,#chat{-webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px);background:rgba(10,40,60,.72)}
+#mb{background:rgba(10,40,60,.96)}
 header{display:flex;justify-content:space-between;align-items:center;padding:12px 16px;margin:12px 0;position:sticky;top:8px;z-index:5}
 header b{font-size:18px}header small{display:block;color:var(--m);font-size:10px;letter-spacing:2px}
 #mk{font-size:12px;padding:5px 10px;border-radius:99px;background:rgba(255,255,255,.12)}
 .up{color:var(--g)}.dn{color:var(--r)}.mut{color:var(--m);font-size:12px}
-.row{display:grid;grid-template-columns:1fr auto;gap:2px 10px;padding:12px 16px;margin-bottom:10px;cursor:pointer;transition:transform .2s cubic-bezier(.3,1.6,.5,1)}
-.row:active{transform:scale(.96) rotate(-.5deg)}.row small{color:var(--m);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.row .p{text-align:right}
+.row{display:grid;grid-template-columns:1fr auto;gap:2px 10px;padding:12px 16px;margin-bottom:10px;cursor:pointer;transition:transform .15s ease;-webkit-tap-highlight-color:transparent;content-visibility:auto;contain-intrinsic-size:64px}
+.row:active{transform:scale(.97)}.row small{color:var(--m);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.row .p{text-align:right}
 h3{margin:16px 4px 8px;font-size:14px;color:var(--m);font-weight:600}
 input{width:100%;padding:14px 16px;border-radius:16px;border:1px solid rgba(255,255,255,.2);background:rgba(255,255,255,.08);color:var(--t);font-size:15px;outline:none}
 button{font:inherit;color:var(--t);border:1px solid rgba(255,255,255,.25);background:rgba(255,255,255,.14);border-radius:14px;padding:10px 16px;cursor:pointer}
@@ -251,11 +273,7 @@ button{font:inherit;color:var(--t);border:1px solid rgba(255,255,255,.25);backgr
 #chat{right:12px;left:12px;bottom:calc(150px + env(safe-area-inset-bottom));max-width:420px;margin-left:auto;padding:14px;max-height:55vh;flex-direction:column}
 #log{overflow:auto;flex:1;margin-bottom:10px;font-size:14px}#log p{margin:6px 0}#log .u{color:var(--g)}
 .err{padding:16px;text-align:center}
-@media(prefers-reduced-motion:reduce){.blob{animation:none}}
 </style></head><body>
-<div class="blob" style="width:320px;height:320px;background:#1fb6c9;top:-60px;left:-80px"></div>
-<div class="blob" style="width:280px;height:280px;background:#2ee6a6;bottom:5%;right:-90px;animation-delay:-6s"></div>
-<canvas id="fx"></canvas>
 <div id="app">
 <header class="glass"><div><b>EquityScan</b><small>MARKET INTELLIGENCE</small></div><span id="mk">Checking…</span></header>
 <main id="view"></main>
@@ -282,33 +300,44 @@ function skel(){return '<div class="sk"></div><div class="sk"></div><div class="
 function errBox(e,retry){return '<div class="err glass"><p>'+esc(e.message)+'</p><br><button onclick="'+retry+'()">Retry</button></div>'}
 function row(s){
   var c=(s.percentChange||0)>=0?'up':'dn',sg=(s.percentChange||0)>=0?'+':'';
-  return '<div class="row glass" data-s="'+esc(s.symbol)+'"><b>'+esc(s.symbol)+'</b><span class="p">₹'+n(s.currentPrice)+'</span><small>'+esc(s.companyName||s.sector||'')+(s.source&&s.source!=='provider'?' · '+esc(s.source):'')+'</small><span class="p '+c+'">'+sg+n(s.percentChange)+'%</span></div>';
+  return '<div class="row glass" data-s="'+esc(s.symbol)+'"><b>'+esc(s.symbol)+'</b><span class="p">₹'+n(s.currentPrice)+'</span><small>'+esc(s.companyName||s.sector||'')+(s.source==='stale'?' · updating':'')+'</small><span class="p '+c+'">'+sg+n(s.percentChange)+'%</span></div>';
 }
 function setView(h){var v=$('#view');if(v)v.innerHTML=h}
 function loadRows(sig){return api('/api/stocks',null,sig).then(function(d){rows=d.rows;return rows})}
 function isAbort(e){return e&&e.name==='AbortError'}
 
+function poll(sig,render,tries){
+  return api('/api/stocks',null,sig).then(function(d){
+    rows=d.rows;render(d);
+    if(d.loading>0&&(tries||0)<24&&!sig.aborted)return new Promise(function(r){setTimeout(r,2500)}).then(function(){if(!sig.aborted)return poll(sig,render,(tries||0)+1)});
+  });
+}
+function more(d){return d&&d.loading>0&&d.rows.length?'<p class="mut" style="text-align:center">Loading '+d.loading+' more…</p>':''}
+function waiting(d,retry){return d.error?errBox(new Error('NSE is not responding ('+(d.error.status||d.error.message)+'). Retrying…'),retry):skel()}
 function dash(){
-  setView(skel());
-  loadRows(newSignal()).then(function(r){
-    if(tab!=='dash')return;
+  setView(skel());var sig=newSignal();
+  poll(sig,function(d){
+    if(tab!=='dash')return;var r=d.rows;
+    if(!r.length){setView(waiting(d,'dash'));return}
     var by=function(k,dir){return r.slice().sort(function(a,b){return((a[k]||0)-(b[k]||0))*dir}).slice(0,4).map(row).join('')};
-    setView('<h3>Top gainers</h3>'+by('percentChange',-1)+'<h3>Top losers</h3>'+by('percentChange',1)+'<h3>Most active</h3>'+by('volume',-1));
+    setView('<h3>Top gainers</h3>'+by('percentChange',-1)+'<h3>Top losers</h3>'+by('percentChange',1)+'<h3>Most active</h3>'+by('volume',-1)+more(d));
   }).catch(function(e){if(!isAbort(e))setView(errBox(e,'dash'))});
 }
 function mkt(){
   setView('<input id="f" placeholder="Search symbol or company"><div id="list" style="margin-top:12px">'+skel()+'</div>');
-  var draw=function(){var f=$('#f'),l=$('#list');if(!f||!l)return;var q=f.value.toLowerCase();
-    l.innerHTML=rows.filter(function(s){return(s.symbol+' '+(s.companyName||'')).toLowerCase().indexOf(q)>-1}).map(row).join('')||'<p class="mut">No matches.</p>'};
-  var f=$('#f');if(f)f.oninput=draw;
-  loadRows(newSignal()).then(function(){if(tab==='mkt')draw()}).catch(function(e){var l=$('#list');if(l&&!isAbort(e))l.innerHTML=errBox(e,'mkt')});
+  var lastD=null;
+  var draw=function(d){if(d)lastD=d;var f=$('#f'),l=$('#list');if(!f||!l)return;var q=f.value.toLowerCase();
+    var h=rows.filter(function(s){return(s.symbol+' '+(s.companyName||'')).toLowerCase().indexOf(q)>-1}).map(row).join('');
+    l.innerHTML=(h||(!rows.length&&lastD?waiting(lastD,'mkt'):'<p class="mut">No matches.</p>'))+more(lastD)};
+  var f=$('#f');if(f)f.oninput=function(){draw()};
+  poll(newSignal(),function(d){if(tab==='mkt')draw(d)}).catch(function(e){var l=$('#list');if(l&&!isAbort(e))l.innerHTML=errBox(e,'mkt')});
 }
 function wlv(){
   if(!wl.length){setView('<div class="err glass"><p>Your watchlist is empty.</p><p class="mut">Open any stock and tap “Add to watchlist”.</p></div>');return}
   setView(skel());
-  loadRows(newSignal()).then(function(){if(tab!=='wl')return;
+  poll(newSignal(),function(d){if(tab!=='wl')return;
     var m=rows.filter(function(s){return wl.indexOf(s.symbol)>-1});
-    setView(m.map(row).join('')||'<p class="mut">No data for your symbols yet.</p>');
+    setView(m.length?m.map(row).join('')+more(d):waiting(d,'wlv'));
   }).catch(function(e){if(!isAbort(e))setView(errBox(e,'wlv'))});
 }
 function scr(){
@@ -370,20 +399,6 @@ function chatInit(){
   };
 }
 
-/* water ripples */
-var cv=$('#fx'),cx=cv&&cv.getContext('2d'),rp=[],last=0,still=matchMedia('(prefers-reduced-motion:reduce)').matches;
-function sz(){if(cv){cv.width=innerWidth;cv.height=innerHeight}}sz();addEventListener('resize',sz);
-function add(x,y,a){rp.push({x:x,y:y,r:4,a:a})}
-if(!still){
-  addEventListener('pointermove',function(e){var t=Date.now();if(t-last>60){last=t;add(e.clientX,e.clientY,.35)}});
-  addEventListener('pointerdown',function(e){add(e.clientX,e.clientY,.65)});
-  (function loop(){
-    if(cx&&!document.hidden){cx.clearRect(0,0,cv.width,cv.height);rp=rp.filter(function(p){return p.a>.015});
-      rp.forEach(function(p){p.r+=2.4;p.a*=.955;cx.lineWidth=2;cx.strokeStyle='rgba(180,240,255,'+p.a+')';cx.beginPath();cx.arc(p.x,p.y,p.r,0,6.283);cx.stroke();
-        cx.strokeStyle='rgba(255,255,255,'+p.a/2+')';cx.beginPath();cx.arc(p.x,p.y,p.r*.65,0,6.283);cx.stroke()})}
-    requestAnimationFrame(loop)})();
-}
-
 /* boot */
 document.addEventListener('click',function(e){var r=e.target.closest&&e.target.closest('.row');if(r&&r.dataset.s)openDetail(r.dataset.s)});
 var mdl=$('#modal');if(mdl)mdl.onclick=function(e){if(e.target===mdl)closeDetail()};
@@ -394,6 +409,11 @@ drawTabs();chatInit();market();setInterval(market,60000);go('dash');
 /* ---------- START + BACKGROUND PRE-WARMER ---------- */
 app.listen(C.port, () => {
   console.log("[EquityScan] http://localhost:" + C.port + (C.groqKey ? " (AI on)" : " (AI off: set GROQ_API_KEY)"));
-  const warm = () => allStocks().catch(() => {});
+  const warm = async () => {
+    try {
+      const m = await marketStatus();
+      if (m.status !== "CLOSED" || !have().length) refreshStale();
+    } catch (e) {}
+  };
   warm(); setInterval(warm, C.refresh);
 });
