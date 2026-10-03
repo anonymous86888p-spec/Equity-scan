@@ -1,0 +1,4 @@
+node_modules
+.budget-state.json
+.groq-budget-state.json
+.env
