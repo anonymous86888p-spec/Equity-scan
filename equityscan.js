@@ -91,8 +91,24 @@ async function marketStatus() {
   } catch (e) { return stale(k) || { status: "UNKNOWN", tradeDate: null }; }
 }
 
+/* ---------- GROQ MODEL AUTO-PICK (Groq renames/retires models often) ---------- */
+let pickedModel = null;
+async function pickModel() {
+  if (pickedModel) return pickedModel;
+  const prefs = [process.env.GROQ_MODEL, "openai/gpt-oss-120b", "openai/gpt-oss-20b", "llama-3.3-70b-versatile", "llama-3.1-8b-instant"].filter(Boolean);
+  try {
+    const r = await fetch("https://api.groq.com/openai/v1/models", { headers: { Authorization: "Bearer " + C.groqKey } });
+    if (r.ok) {
+      const ids = (((await r.json()) || {}).data || []).map((m) => m.id);
+      const found = prefs.find((x) => ids.includes(x)) || ids.find((id) => !/whisper|orpheus|guard|compound|tts|allam/i.test(id));
+      if (found) { console.log("[EquityScan] Groq model:", found); return (pickedModel = found); }
+    }
+  } catch (e) {}
+  return prefs[0];
+}
+
 /* ---------- GROQ CLIENT ---------- */
-async function groq(messages, maxTokens) {
+async function groq(messages, maxTokens, retry = true) {
   if (!C.groqKey) throw fail("AI_NOT_CONFIGURED", "GROQ_API_KEY is not set, so AI features are off.", 503);
   if (!aiBudget.can()) throw fail("RATE_LIMITED", "Daily AI budget used up. Try after reset.", 429);
   const ac = new AbortController(), t = setTimeout(() => ac.abort(), 20000);
@@ -101,13 +117,17 @@ async function groq(messages, maxTokens) {
     res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
       method: "POST", signal: ac.signal,
       headers: { "Content-Type": "application/json", Authorization: "Bearer " + C.groqKey },
-      body: JSON.stringify({ model: C.model, messages, max_tokens: maxTokens, temperature: 0 }),
+      body: JSON.stringify({ model: await pickModel(), messages, max_tokens: maxTokens, temperature: 0 }),
     });
   } catch (e) { throw fail("PROVIDER_UNAVAILABLE", e.name === "AbortError" ? "AI timed out." : e.message, 503); }
   finally { clearTimeout(t); }
   if (res.status === 401) throw fail("PROVIDER_UNAVAILABLE", "Groq rejected the API key.", 503);
   if (res.status === 429) throw fail("RATE_LIMITED", "Groq rate limit hit.", 429);
-  if (!res.ok) throw fail("PROVIDER_UNAVAILABLE", "Groq error " + res.status, 503);
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    if (retry && (res.status === 404 || (res.status === 400 && /model/i.test(body)))) { pickedModel = null; return groq(messages, maxTokens, false); }
+    throw fail("PROVIDER_UNAVAILABLE", "Groq error " + res.status + ": " + body.slice(0, 150), 503);
+  }
   aiBudget.spend();
   const j = await res.json(), c = j && j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content;
   if (!c) throw fail("INVALID_PROVIDER_RESPONSE", "Empty AI reply.", 502);
