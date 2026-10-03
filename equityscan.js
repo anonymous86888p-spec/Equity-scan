@@ -128,6 +128,64 @@ async function loadIndexLadder() {
   throw lastE;
 }
 
+/* ---------- YAHOO FINANCE (free, no key) - merged with NSE ---------- */
+const YF_LIST = ["ADANIENT","ADANIPORTS","APOLLOHOSP","ASIANPAINT","AXISBANK","BAJAJ-AUTO","BAJFINANCE","BAJAJFINSV","BEL","BHARTIARTL","CIPLA","COALINDIA","DRREDDY","EICHERMOT","ETERNAL","GRASIM","HCLTECH","HDFCBANK","HDFCLIFE","HEROMOTOCO","HINDALCO","HINDUNILVR","ICICIBANK","INDUSINDBK","INFY","ITC","JIOFIN","JSWSTEEL","KOTAKBANK","LT","M&M","MARUTI","NESTLEIND","NTPC","ONGC","POWERGRID","RELIANCE","SBILIFE","SBIN","SHRIRAMFIN","SUNPHARMA","TATACONSUM","TATAMOTORS","TATASTEEL","TCS","TECHM","TITAN","TRENT","ULTRACEMCO","WIPRO",
+  "ABB","ADANIGREEN","ADANIPOWER","AMBUJACEM","BANKBARODA","BOSCHLTD","CANBK","CHOLAFIN","COLPAL","DABUR","DLF","DIVISLAB","GAIL","GODREJCP","HAVELLS","HAL","ICICIGI","ICICIPRULI","INDIGO","IOC","IRCTC","IRFC","JINDALSTEL","LICI","LODHA","LTIM","MARICO","MUTHOOTFIN","NAUKRI","PFC","PIDILITIND","PNB","RECLTD","SHREECEM","SIEMENS","SRF","TVSMOTOR","TORNTPHARM","UNIONBANK","UNITDSPR","VBL","VEDL","ZYDUSLIFE","BPCL","BERGEPAINT","CGPOWER","MAXHEALTH","POLYCAB","PERSISTENT"];
+let yfClient = null, yahooError = null, yahooRun = null, yahooAt = 0, yahooTry = 0;
+const yahooSyms = new Set();
+async function yahooClient() {
+  if (yfClient) return yfClient;
+  const mod = await import("yahoo-finance2");
+  const Y = mod.default || mod;
+  yfClient = typeof Y === "function" ? new Y({ suppressNotices: ["yahooSurvey"] }) : Y;
+  return yfClient;
+}
+async function loadYahoo() {
+  const yf = await yahooClient();
+  const syms = [...new Set([...YF_LIST, ...universe])].slice(0, 600);
+  let ok = 0;
+  for (let i = 0; i < syms.length; i += 100) {
+    const chunk = syms.slice(i, i + 100);
+    const res = await tmo(yf.quote(chunk.map((x) => x + ".NS"), {}, { validateResult: false }), 25000);
+    for (const q of Array.isArray(res) ? res : res ? [res] : []) {
+      if (!q || !q.symbol || num(q.regularMarketPrice) === null) continue;
+      const sym = String(q.symbol).replace(/\.NS$/, "");
+      const price = num(q.regularMarketPrice), hi = num(q.fiftyTwoWeekHigh), lo = num(q.fiftyTwoWeekLow);
+      const got = [price, hi, lo].filter((x) => x !== null).length;
+      const t = q.regularMarketTime instanceof Date ? q.regularMarketTime.toISOString() : q.regularMarketTime ? new Date(Number(q.regularMarketTime) * 1000).toISOString() : null;
+      cset("y:" + sym, {
+        symbol: sym, companyName: q.longName || q.shortName || null, sector: null, currentPrice: price,
+        previousClose: num(q.regularMarketPreviousClose), change: num(q.regularMarketChange), percentChange: num(q.regularMarketChangePercent),
+        open: num(q.regularMarketOpen), dayHigh: num(q.regularMarketDayHigh), dayLow: num(q.regularMarketDayLow), week52High: hi, week52Low: lo,
+        volume: num(q.regularMarketVolume), lastUpdated: t, marketCap: num(q.marketCap), pe: num(q.trailingPE),
+        highPercent: price !== null && hi ? Number(((price / hi) * 100).toFixed(2)) : null,
+        dataStatus: got === 3 ? "COMPLETE" : got === 0 ? "UNAVAILABLE" : "PARTIAL",
+      }, C.ttl);
+      yahooSyms.add(sym); ok++;
+    }
+  }
+  if (!ok) throw fail("PROVIDER_UNAVAILABLE", "Yahoo returned no quotes.", 503);
+  return ok;
+}
+function refreshYahoo() {
+  if (yahooRun || Date.now() - yahooTry < 30000 || Date.now() - yahooAt < C.ttl) return yahooRun;
+  yahooTry = Date.now();
+  yahooRun = loadYahoo().then(() => { yahooAt = Date.now(); yahooError = null; })
+    .catch((e) => { yahooError = String((e && e.message) || e).slice(0, 140); console.warn("[EquityScan] Yahoo failed:", yahooError); })
+    .finally(() => { yahooRun = null; });
+  return yahooRun;
+}
+async function yahooChart(sym, range) {
+  const yf = await yahooClient(), now = Date.now();
+  const opts = range === "1d" ? { period1: new Date(now - 5 * 864e5), interval: "5m" } : { period1: new Date(now - { "1m": 31, "6m": 183, "1y": 366 }[range] * 864e5), interval: "1d" };
+  const res = await tmo(yf.chart(sym + ".NS", opts, { validateResult: false }), 25000);
+  let pts = ((res && res.quotes) || []).filter((r) => r && r.close != null && r.date)
+    .map((r) => (range === "1d" ? [new Date(r.date).getTime() + 19800000, Number(r.close)] : [new Date(r.date).getTime(), Number(r.close), Number(r.volume) || 0]));
+  if (range === "1d" && pts.length) { const day = Math.floor(pts[pts.length - 1][0] / 864e5); pts = pts.filter((x) => Math.floor(x[0] / 864e5) === day); }
+  if (!pts.length) throw fail("PROVIDER_UNAVAILABLE", "No Yahoo chart data.", 503);
+  return pts;
+}
+
 /* Stale-while-revalidate: always answer instantly from cache; refresh in the background. */
 let bg = null, lastBg = 0;
 function refreshStale() {
@@ -143,15 +201,20 @@ function refreshStale() {
   return bg;
 }
 const have = () => {
-  const list = universe.map((x) => { const f = cget("s:" + x); const v = f || stale("s:" + x); return v ? { ...v, source: f ? "cache" : "stale" } : null; }).filter(Boolean);
+  const list = [];
+  for (const x of new Set([...universe, ...yahooSyms])) {
+    const f = cget("s:" + x), nv = f || stale("s:" + x), yf = cget("y:" + x), yv = yf || stale("y:" + x), base = nv || yv;
+    if (!base) continue;
+    list.push({ ...base, marketCap: yv ? yv.marketCap : null, pe: yv ? yv.pe : null, via: nv ? "NSE" : "Yahoo", source: nv ? (f ? "cache" : "stale") : (yf ? "cache" : "stale") });
+  }
   const vols = list.map((r) => r.volume).filter((v) => v > 0).sort((a, b) => a - b);
   const med = vols.length ? vols[Math.floor(vols.length / 2)] : null;
   return list.map((r) => ({ ...r, relVolume: med && r.volume ? Number((r.volume / med).toFixed(2)) : null }));
 };
 async function allStocks() {
   let rows = have();
-  const p = refreshStale();
-  if (p && rows.length < universe.length / 2) { await Promise.race([p, sleep(10000)]); rows = have(); }
+  const ps = [refreshStale(), refreshYahoo()].filter(Boolean);
+  if (ps.length && rows.length < universe.length / 2) { await Promise.race([Promise.all(ps), sleep(10000)]); rows = have(); }
   return rows;
 }
 
@@ -208,7 +271,7 @@ async function groq(messages, maxTokens, retry = true) {
 }
 
 /* ---------- NATURAL-LANGUAGE QUERY ---------- */
-const FIELDS = { currentPrice: "price in INR", percentChange: "today's % change", volume: "shares traded today", week52High: "52-week high", week52Low: "52-week low", highPercent: "price as % of 52-week high (0-100)", relVolume: "volume relative to the typical (median) stock in the app; 1 = typical, 2 = twice as busy" };
+const FIELDS = { currentPrice: "price in INR", percentChange: "today's % change", volume: "shares traded today", week52High: "52-week high", week52Low: "52-week low", highPercent: "price as % of 52-week high (0-100)", relVolume: "volume relative to the typical (median) stock in the app; 1 = typical, 2 = twice as busy", marketCap: "market capitalisation in INR (1 crore = 10000000, 1 lakh crore = 1000000000000)", pe: "trailing price/earnings ratio" };
 const OPS = ["<", ">", "<=", ">="];
 const QPROMPT = 'Convert a stock search into JSON only (no prose, no code fences): {"sector":string|null,"filters":[{"field":string,"op":"<"|">"|"<="|">=","value":number}],"sortBy":string|null,"sortDir":"asc"|"desc","limit":number|null,"unsupported":[string]}. Allowed fields: ' +
   Object.entries(FIELDS).map(([k, v]) => k + " (" + v + ")").join("; ") +
@@ -262,21 +325,36 @@ app.get("/api/debug/nse", h(async (q) => {
     const r = typeof nse.getEquityStockIndices === "function" ? await tmo(nse.getEquityStockIndices(C.index), 25000) : await tmo(nse.getDataByEndpoint("/api/equity-stockIndices?index=" + encodeURIComponent(C.index)), 25000);
     out.index = { ok: true, name: C.index, ms: Date.now() - t, count: Array.isArray(r && r.data) ? r.data.length : null, sampleKeys: r && r.data && r.data[1] ? Object.keys(r.data[1]) : null, hasGetter: typeof nse.getEquityStockIndices === "function" };
   } catch (e) { out.index = { ...fmt(e), ms: Date.now() - t, name: C.index }; }
+  t = Date.now();
+  try {
+    const yq = await tmo((await yahooClient()).quote([sym + ".NS"], {}, { validateResult: false }), 20000);
+    const q0 = Array.isArray(yq) ? yq[0] : yq;
+    out.yahoo = { ok: !!q0, ms: Date.now() - t, price: q0 ? q0.regularMarketPrice : null, marketCap: q0 ? q0.marketCap : null, pe: q0 ? q0.trailingPE : null };
+  } catch (e) { out.yahoo = { ...fmt(e), ms: Date.now() - t }; }
+  out.yahooSymbols = yahooSyms.size; out.yahooError = yahooError;
   out.universeSize = universe.length;
   out.lastNseError = lastNseError; out.nseBudgetUsed = nseBudget.u;
   return out;
 }));
 app.get("/api/market-status", h(marketStatus));
 app.get("/api/stocks", h(async () => {
-  refreshStale();
-  const rows = have();
-  return { rows, loading: Math.max(0, universe.length - rows.length), total: universe.length, index: loadedIndex && universe.length > C.U.length ? loadedIndex : null, indexError, error: rows.length ? null : lastNseError };
+  refreshStale(); refreshYahoo();
+  const rows = have(), mix = { NSE: 0, Yahoo: 0 };
+  rows.forEach((r) => { mix[r.via]++; });
+  return {
+    rows, loading: Math.max(0, universe.length - rows.length), total: Math.max(universe.length, rows.length), mix,
+    index: loadedIndex && universe.length > C.U.length ? loadedIndex : null, indexError,
+    yahooError: yahooSyms.size ? null : yahooError, error: rows.length ? null : lastNseError,
+  };
 }));
+
 app.get("/api/stock/:symbol", h(async (q) => {
   const sym = String(q.params.symbol || "").trim().toUpperCase();
   if (!/^[A-Z0-9&-]{1,20}$/.test(sym)) throw fail("INVALID_SYMBOL", '"' + sym + '" is not a valid NSE symbol.', 400);
   const k = "s:" + sym, f = cget(k), st = f || stale(k);
-  if (st) { if (!f) getStock(sym).catch(() => {}); return { ...st, source: f ? "cache" : "stale" }; }
+  if (st) { if (!f) getStock(sym).catch(() => {}); return { ...st, source: f ? "cache" : "stale", via: "NSE" }; }
+  const y = cget("y:" + sym) || stale("y:" + sym);
+  if (y) { getStock(sym).catch(() => {}); return { ...y, source: "cache", via: "Yahoo" }; }
   return getStock(sym);
 }));
 app.get("/api/chart/:symbol", h(async (q) => {
@@ -304,8 +382,10 @@ app.get("/api/chart/:symbol", h(async (q) => {
       }
     } catch (e) {
       const old = stale(k); if (old) return old;
-      throw e && e.code ? e : fail("PROVIDER_UNAVAILABLE", "Chart data unavailable: " + String((e && e.message) || e).slice(0, 120), 503);
+      try { pts = await yahooChart(sym, range); }
+      catch (e2) { throw e && e.code ? e : fail("PROVIDER_UNAVAILABLE", "Chart data unavailable: " + String((e && e.message) || e).slice(0, 120), 503); }
     }
+    if (!pts.length) { try { pts = await yahooChart(sym, range); } catch (e3) {} }
     if (pts.length > 120) {
       const step = Math.ceil(pts.length / 120), out = [];
       for (let i = 0; i < pts.length; i += step) {
@@ -415,11 +495,12 @@ function api(p,body,sig){
 }
 function skel(){return '<div class="sk"></div><div class="sk"></div><div class="sk"></div><div class="sk"></div>'}
 function errBox(e,retry){return '<div class="err glass"><p>'+esc(e.message)+'</p><br><button onclick="'+retry+'()">Retry</button></div>'}
+function mcf(v){if(v==null)return '–';if(v>=1e12)return (v/1e12).toFixed(2)+' L Cr';return (v/1e7).toLocaleString('en-IN',{maximumFractionDigits:0})+' Cr'}
 function vf(v){if(v==null)return '–';if(v>=1e7)return (v/1e7).toFixed(2)+' Cr';if(v>=1e5)return (v/1e5).toFixed(2)+' L';if(v>=1e3)return (v/1e3).toFixed(1)+' K';return String(v)}
 function calcMax(){maxVol=Math.max.apply(null,rows.map(function(v){return v.volume||0}).concat([1]))}
 function row(s){
   var up=(s.percentChange||0)>=0,rel=s.relVolume,w=Math.min(100,(s.volume||0)/maxVol*100);
-  return '<div class="row glass" data-s="'+esc(s.symbol)+'"><div class="l"><b>'+esc(s.symbol)+'</b><small>'+esc(s.companyName||s.sector||'')+(s.source==='stale'?' · updating':'')+'</small></div>'+
+  return '<div class="row glass" data-s="'+esc(s.symbol)+'"><div class="l"><b>'+esc(s.symbol)+'</b><small>'+esc(s.companyName||s.sector||'')+(s.via==='Yahoo'?' · Yahoo':'')+(s.source==='stale'?' · updating':'')+'</small></div>'+
     '<div class="r"><span class="pr">₹'+n(s.currentPrice)+'</span><span class="pill '+(up?'up':'dn')+'">'+(up?'+':'')+n(s.percentChange)+'%</span></div>'+
     '<div class="vol'+(rel>=2?' hot':'')+'"><i style="width:'+w+'%"></i><em>Vol '+vf(s.volume)+(rel>=1.5?' · '+rel.toFixed(1)+'× busy':'')+'</em></div></div>';
 }
@@ -445,7 +526,7 @@ function dash(){
     var by=function(k,dir,min){return r.filter(function(x){return min==null||(x[k]||0)>=min}).sort(function(a,b){return((a[k]||0)-(b[k]||0))*dir}).slice(0,4).map(row).join('')};
     var surge=by('relVolume',-1,1.5);
     setView('<div class="sum glass"><div><small>Advancing</small><b class="up">'+adv+'</b></div><div><small>Declining</small><b class="dn">'+dec+'</b></div><div><small>Total volume</small><b>'+vf(tot)+'</b></div></div><div class="split"><i style="width:'+pct+'%"></i></div>'+
-      '<p class="mut" style="text-align:center;margin:-4px 0 6px">Tracking '+r.length+' stocks'+(d.index?' · '+esc(d.index):'')+'</p>'+(d.indexError?'<p class="mut" style="text-align:center;margin:0 0 8px">Full list unavailable ('+esc(d.indexError)+')</p>':'')+'<h3>Top gainers</h3>'+by('percentChange',-1)+'<h3>Top losers</h3>'+by('percentChange',1)+'<h3>Most active by volume</h3>'+by('volume',-1)+(surge?'<h3>Volume surge (busier than usual)</h3>'+surge:'')+more(d));
+      '<p class="mut" style="text-align:center;margin:-4px 0 6px">Tracking '+r.length+' stocks'+(d.index?' · '+esc(d.index):'')+(d.mix&&d.mix.Yahoo?' · NSE '+d.mix.NSE+' + Yahoo '+d.mix.Yahoo:'')+'</p>'+(d.yahooError?'<p class="mut" style="text-align:center;margin:0 0 8px">Yahoo unavailable ('+esc(d.yahooError)+')</p>':'')+(d.indexError?'<p class="mut" style="text-align:center;margin:0 0 8px">Full list unavailable ('+esc(d.indexError)+')</p>':'')+'<h3>Top gainers</h3>'+by('percentChange',-1)+'<h3>Top losers</h3>'+by('percentChange',1)+'<h3>Most active by volume</h3>'+by('volume',-1)+(surge?'<h3>Volume surge (busier than usual)</h3>'+surge:'')+more(d));
   }).catch(function(e){if(!isAbort(e))setView(errBox(e,'dash'))});
 }
 function mkt(){
@@ -544,7 +625,7 @@ function openDetail(sym){
       '<div style="font-size:32px;margin:12px 0">₹'+n(s.currentPrice)+' <span class="'+c+'" style="font-size:16px">'+n(s.change)+' ('+n(s.percentChange)+'%)</span></div>'+
       '<div class="mut">Day range: ₹'+n(s.dayLow)+' – ₹'+n(s.dayHigh)+'</div>'+
       '<div class="chips" id="rg" style="margin-top:12px"></div><div id="ch" style="min-height:130px"></div><div id="cv" class="mut" style="font-size:12px;min-height:16px;margin-bottom:4px"></div><div class="mut" style="margin-top:10px">52-week range</div><div class="bar"><i style="left:'+pos+'%"></i></div><div class="mut" style="display:flex;justify-content:space-between"><span>₹'+n(s.week52Low)+'</span><span>₹'+n(s.week52High)+'</span></div>'+
-      '<div class="mut" style="margin-top:12px">Volume today</div><div style="display:flex;justify-content:space-between;align-items:baseline"><b style="font-size:20px">'+vf(s.volume)+'</b><span class="mut">'+(rel?rel.toFixed(1)+'× typical':'')+'</span></div><div class="vol big'+(rel>=2?' hot':'')+'"><i style="width:'+vw+'%"></i></div><p class="mut" style="margin-top:10px">Updated: '+esc(s.lastUpdated||'–')+' · Data: '+esc(s.dataStatus)+(s.source==='stale'?' · updating':'')+'</p>'+
+      (rr&&(rr.marketCap||rr.pe)?'<p class="mut" style="margin-top:10px">'+(rr.marketCap?'Market cap ₹'+mcf(rr.marketCap):'')+(rr.marketCap&&rr.pe?' · ':'')+(rr.pe?'P/E '+n(rr.pe):'')+'</p>':'')+'<div class="mut" style="margin-top:12px">Volume today</div><div style="display:flex;justify-content:space-between;align-items:baseline"><b style="font-size:20px">'+vf(s.volume)+'</b><span class="mut">'+(rel?rel.toFixed(1)+'× typical':'')+'</span></div><div class="vol big'+(rel>=2?' hot':'')+'"><i style="width:'+vw+'%"></i></div><p class="mut" style="margin-top:10px">Updated: '+esc(s.lastUpdated||'–')+' · Data: '+esc(s.dataStatus)+(s.source==='stale'?' · updating':'')+'</p>'+
       '<button id="w" style="margin-top:14px;width:100%">'+(on?'Remove from watchlist':'Add to watchlist')+'</button>';
     loadChart(s.symbol);
     var x=$('#x'),w=$('#w');
@@ -580,7 +661,7 @@ app.listen(C.port, () => {
   const warm = async () => {
     try {
       const m = await marketStatus();
-      if (m.status !== "CLOSED" || !have().length) refreshStale();
+      if (m.status !== "CLOSED" || !have().length) { refreshStale(); refreshYahoo(); }
     } catch (e) {}
   };
   warm(); setInterval(warm, C.refresh);
