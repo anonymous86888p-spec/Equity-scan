@@ -48,6 +48,7 @@ async function pool(arr, n, fn) {
 
 /* ---------- NSE PROVIDER + NORMALIZE (never fabricate: missing = null) ---------- */
 const nse = new NseIndia();
+let lastNseError = null;
 const num = (v) => { const x = Number(v); return Number.isFinite(x) ? x : null; };
 function norm(symbol, raw) {
   if (!raw || typeof raw !== "object") return null;
@@ -72,7 +73,13 @@ async function getStock(sym) {
     let raw, err;
     for (let i = 0; i <= 2 && !raw; i++) {
       try { raw = await tmo(nse.getEquityDetails(sym), 10000); }
-      catch (e) { err = e; if (e && e.response && e.response.status === 403) break; await sleep(250 * 2 ** i); }
+      catch (e) {
+        err = e;
+        lastNseError = { at: new Date().toISOString(), symbol: sym, status: (e && e.response && e.response.status) || null, message: String((e && e.message) || e).slice(0, 200) };
+        console.warn("[EquityScan] NSE fail", sym, lastNseError.status, lastNseError.message);
+        if (e && e.response && e.response.status === 403) break;
+        await sleep(250 * 2 ** i);
+      }
     }
     if (!raw) { if (old) return { ...old, source: "stale" }; throw fail("PROVIDER_UNAVAILABLE", "NSE unavailable: " + (err && err.message), 503); }
     nseBudget.spend();
@@ -167,7 +174,25 @@ const h = (fn) => async (q, r) => {
   try { r.json({ success: true, data: await fn(q) }); }
   catch (e) { r.status(e.status || 500).json({ success: false, error: { code: e.code || "INTERNAL_ERROR", message: e.message || "Internal error." } }); }
 };
-app.get("/api/health", h(async () => ({ ok: true, ai: !!C.groqKey, nseBudgetUsed: nseBudget.u, aiBudgetUsed: aiBudget.u })));
+app.get("/api/health", h(async () => ({ ok: true, ai: !!C.groqKey, nseBudgetUsed: nseBudget.u, aiBudgetUsed: aiBudget.u, lastNseError })));
+app.get("/api/debug/nse", h(async (q) => {
+  const sym = String(q.query.symbol || "TCS").toUpperCase().replace(/[^A-Z0-9&-]/g, "").slice(0, 20) || "TCS";
+  const out = { symbol: sym, lib: null };
+  try { out.lib = require("stock-nse-india/package.json").version; } catch (e) {}
+  const fmt = (e) => ({ ok: false, status: (e && e.response && e.response.status) || null, code: (e && e.code) || null, message: String((e && e.message) || e).slice(0, 200) });
+  let t = Date.now();
+  try {
+    const raw = await tmo(nse.getEquityDetails(sym), 12000);
+    out.equity = { ok: true, ms: Date.now() - t, topKeys: Object.keys(raw || {}), priceInfoKeys: Object.keys((raw && raw.priceInfo) || {}), lastPrice: raw && raw.priceInfo ? raw.priceInfo.lastPrice : null };
+  } catch (e) { out.equity = { ...fmt(e), ms: Date.now() - t }; }
+  t = Date.now();
+  try {
+    const m = await tmo(nse.getMarketStatus(), 12000);
+    out.market = { ok: true, ms: Date.now() - t, keys: Object.keys(m || {}) };
+  } catch (e) { out.market = { ...fmt(e), ms: Date.now() - t }; }
+  out.lastNseError = lastNseError; out.nseBudgetUsed = nseBudget.u;
+  return out;
+}));
 app.get("/api/market-status", h(marketStatus));
 app.get("/api/stocks", h(async () => ({ rows: await allStocks() })));
 app.get("/api/stock/:symbol", h(async (q) => {
