@@ -89,12 +89,13 @@ async function getStock(sym) {
 }
 /* ---------- BULK UNIVERSE: one NSE call returns every stock in an index ---------- */
 let universe = C.U.slice();
-async function loadIndex() {
+let loadedIndex = null, indexError = null;
+async function loadIndex(name) {
   if (!nseBudget.can()) throw fail("RATE_LIMITED", "Daily NSE call budget used up.", 429);
   const call = typeof nse.getEquityStockIndices === "function"
-    ? nse.getEquityStockIndices(C.index)
-    : nse.getDataByEndpoint("/api/equity-stockIndices?index=" + encodeURIComponent(C.index));
-  const raw = await tmo(call, Math.max(C.timeout, 20000));
+    ? nse.getEquityStockIndices(name)
+    : nse.getDataByEndpoint("/api/equity-stockIndices?index=" + encodeURIComponent(name));
+  const raw = await tmo(call, Math.max(C.timeout, 25000));
   const arr = raw && Array.isArray(raw.data) ? raw.data : null;
   if (!arr) throw fail("INVALID_PROVIDER_RESPONSE", "Index response had no data.", 502);
   const syms = [];
@@ -118,13 +119,22 @@ async function loadIndex() {
   return syms.length;
 }
 
+async function loadIndexLadder() {
+  let lastE;
+  for (const name of [...new Set([C.index, "NIFTY 100", "NIFTY 50"])]) {
+    try { const c = await loadIndex(name); loadedIndex = name; return c; }
+    catch (e) { lastE = e; indexError = name + ": " + String((e && e.message) || e).slice(0, 120); console.warn("[EquityScan] index", name, "failed:", indexError); }
+  }
+  throw lastE;
+}
+
 /* Stale-while-revalidate: always answer instantly from cache; refresh in the background. */
 let bg = null, lastBg = 0;
 function refreshStale() {
   if (bg || Date.now() - lastBg < 8000) return bg;
   if (universe.every((x) => cget("s:" + x))) return null;
   lastBg = Date.now();
-  bg = loadIndex().catch(async (e) => {
+  bg = loadIndexLadder().then(() => { indexError = null; }).catch(async (e) => {
     lastNseError = { at: new Date().toISOString(), symbol: "INDEX", status: (e && e.response && e.response.status) || null, message: String((e && e.message) || e).slice(0, 200) };
     console.warn("[EquityScan] index load failed, falling back to per-stock:", lastNseError.message);
     const need = C.U.filter((x) => !cget("s:" + x));
@@ -260,7 +270,7 @@ app.get("/api/market-status", h(marketStatus));
 app.get("/api/stocks", h(async () => {
   refreshStale();
   const rows = have();
-  return { rows, loading: Math.max(0, universe.length - rows.length), total: universe.length, index: universe.length > C.U.length ? C.index : null, error: rows.length ? null : lastNseError };
+  return { rows, loading: Math.max(0, universe.length - rows.length), total: universe.length, index: loadedIndex && universe.length > C.U.length ? loadedIndex : null, indexError, error: rows.length ? null : lastNseError };
 }));
 app.get("/api/stock/:symbol", h(async (q) => {
   const sym = String(q.params.symbol || "").trim().toUpperCase();
@@ -268,6 +278,45 @@ app.get("/api/stock/:symbol", h(async (q) => {
   const k = "s:" + sym, f = cget(k), st = f || stale(k);
   if (st) { if (!f) getStock(sym).catch(() => {}); return { ...st, source: f ? "cache" : "stale" }; }
   return getStock(sym);
+}));
+app.get("/api/chart/:symbol", h(async (q) => {
+  const sym = String(q.params.symbol || "").trim().toUpperCase();
+  if (!/^[A-Z0-9&-]{1,20}$/.test(sym)) throw fail("INVALID_SYMBOL", '"' + sym + '" is not a valid NSE symbol.', 400);
+  const range = ["1d", "1m", "6m", "1y"].includes(q.query.range) ? q.query.range : "1d";
+  const k = "c:" + sym + ":" + range, hit = cget(k);
+  if (hit) return hit;
+  return dedupe(k, async () => {
+    if (!nseBudget.can()) { const old = stale(k); if (old) return old; throw fail("RATE_LIMITED", "Daily NSE call budget used up.", 429); }
+    let pts;
+    try {
+      if (range === "1d") {
+        const raw = await tmo(nse.getEquityIntradayData(sym), C.timeout);
+        const g = (raw && (raw.grapthData || raw.graphData)) || [];
+        pts = g.map((r) => [Number(r[0]), Number(r[1])]).filter((r) => Number.isFinite(r[0]) && Number.isFinite(r[1]));
+      } else {
+        const days = { "1m": 31, "6m": 183, "1y": 366 }[range];
+        const raw = await tmo(nse.getEquityHistoricalData(sym, { start: new Date(Date.now() - days * 864e5), end: new Date() }), Math.max(C.timeout, 25000));
+        const pages = Array.isArray(raw) ? raw : [raw];
+        const rows = [].concat(...pages.map((pg) => (pg && pg.data) || []));
+        pts = rows.map((r) => [Date.parse(r.CH_TIMESTAMP || r.mTIMESTAMP || r.date), Number(r.CH_CLOSING_PRICE ?? r.close), Number(r.CH_TOT_TRADED_QTY ?? r.volume)])
+          .filter((r) => Number.isFinite(r[0]) && Number.isFinite(r[1])).sort((a, b) => a[0] - b[0])
+          .map((r) => (Number.isFinite(r[2]) ? r : [r[0], r[1]]));
+      }
+    } catch (e) {
+      const old = stale(k); if (old) return old;
+      throw e && e.code ? e : fail("PROVIDER_UNAVAILABLE", "Chart data unavailable: " + String((e && e.message) || e).slice(0, 120), 503);
+    }
+    if (pts.length > 120) {
+      const step = Math.ceil(pts.length / 120), out = [];
+      for (let i = 0; i < pts.length; i += step) {
+        const ch = pts.slice(i, i + step), last = ch[ch.length - 1];
+        out.push(last.length > 2 ? [last[0], last[1], ch.reduce((a, r) => a + (r[2] || 0), 0)] : [last[0], last[1]]);
+      }
+      pts = out;
+    }
+    nseBudget.spend();
+    return cset(k, { symbol: sym, range, points: pts }, range === "1d" ? 120000 : 6 * 3600000);
+  });
 }));
 app.post("/api/query", h(async (q) => {
   const t = typeof q.body.query === "string" ? q.body.query.trim() : "";
@@ -338,6 +387,7 @@ body{font-variant-numeric:tabular-nums}
 .chips{display:flex;gap:8px;overflow-x:auto;padding:4px 0 10px;scrollbar-width:none}.chips::-webkit-scrollbar{display:none}
 .chips button{white-space:nowrap;padding:7px 12px;font-size:13px;border-radius:99px}
 .chips button.on{background:rgba(46,230,166,.22);border-color:rgba(46,230,166,.5)}
+#rg{padding-bottom:6px}#rg button{padding:5px 12px;font-size:12px}
 #tabs button{display:flex;flex-direction:column;align-items:center;gap:2px;font-size:11px}#tabs button span{font-size:17px;line-height:1}
 </style></head><body>
 <div id="app">
@@ -395,7 +445,7 @@ function dash(){
     var by=function(k,dir,min){return r.filter(function(x){return min==null||(x[k]||0)>=min}).sort(function(a,b){return((a[k]||0)-(b[k]||0))*dir}).slice(0,4).map(row).join('')};
     var surge=by('relVolume',-1,1.5);
     setView('<div class="sum glass"><div><small>Advancing</small><b class="up">'+adv+'</b></div><div><small>Declining</small><b class="dn">'+dec+'</b></div><div><small>Total volume</small><b>'+vf(tot)+'</b></div></div><div class="split"><i style="width:'+pct+'%"></i></div>'+
-      '<p class="mut" style="text-align:center;margin:-4px 0 6px">Tracking '+r.length+' stocks'+(d.index?' · '+esc(d.index):'')+'</p><h3>Top gainers</h3>'+by('percentChange',-1)+'<h3>Top losers</h3>'+by('percentChange',1)+'<h3>Most active by volume</h3>'+by('volume',-1)+(surge?'<h3>Volume surge (busier than usual)</h3>'+surge:'')+more(d));
+      '<p class="mut" style="text-align:center;margin:-4px 0 6px">Tracking '+r.length+' stocks'+(d.index?' · '+esc(d.index):'')+'</p>'+(d.indexError?'<p class="mut" style="text-align:center;margin:0 0 8px">Full list unavailable ('+esc(d.indexError)+')</p>':'')+'<h3>Top gainers</h3>'+by('percentChange',-1)+'<h3>Top losers</h3>'+by('percentChange',1)+'<h3>Most active by volume</h3>'+by('volume',-1)+(surge?'<h3>Volume surge (busier than usual)</h3>'+surge:'')+more(d));
   }).catch(function(e){if(!isAbort(e))setView(errBox(e,'dash'))});
 }
 function mkt(){
@@ -449,6 +499,39 @@ function go(t){tab=t;if(ctl)ctl.abort();
 function drawTabs(){var nav=$('#tabs');if(!nav)return;nav.innerHTML=TABS.map(function(t){return'<button data-t="'+t[0]+'"><span>'+t[2]+'</span>'+t[1]+'</button>'}).join('');
   nav.onclick=function(e){var b=e.target.closest('button');if(b)go(b.dataset.t)}}
 
+var crange='1d',cctl=null;
+function chartSvg(pts,up){
+  var W=320,H=130,P=6,vals=pts.map(function(p){return p[1]}),mn=Math.min.apply(null,vals),mx=Math.max.apply(null,vals),rg=mx-mn||1;
+  var X=function(i){return P+i*(W-2*P)/Math.max(1,pts.length-1)},Y=function(v){return P+(mx-v)*(H-2*P-26)/rg};
+  var d=pts.map(function(p,i){return(i?'L':'M')+X(i).toFixed(1)+' '+Y(p[1]).toFixed(1)}).join('');
+  var col=up?'#2ee6a6':'#ff6b81',mv=Math.max.apply(null,pts.map(function(p){return p[2]||0}).concat([1]));
+  var bars=pts[0].length>2?pts.map(function(p,i){var h=(p[2]||0)/mv*22;return'<rect x="'+(X(i)-1).toFixed(1)+'" y="'+(H-h).toFixed(1)+'" width="2" height="'+h.toFixed(1)+'" fill="rgba(255,255,255,.22)"/>'}).join(''):'';
+  return '<svg id="cs" viewBox="0 0 '+W+' '+H+'" width="100%" style="touch-action:none;display:block"><defs><linearGradient id="gf" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="'+col+'" stop-opacity=".35"/><stop offset="1" stop-color="'+col+'" stop-opacity="0"/></linearGradient></defs><path d="'+d+'L'+X(pts.length-1).toFixed(1)+' '+(H-26)+'L'+X(0).toFixed(1)+' '+(H-26)+'Z" fill="url(#gf)"/><path d="'+d+'" fill="none" stroke="'+col+'" stroke-width="2" stroke-linejoin="round"/>'+bars+'<line id="cl" y1="0" y2="'+H+'" stroke="rgba(255,255,255,.5)" stroke-dasharray="3 3" style="display:none"/></svg>';
+}
+function fmtT(t,range){return new Date(t).toLocaleString('en-IN',range==='1d'?{hour:'2-digit',minute:'2-digit',timeZone:'UTC'}:{day:'numeric',month:'short',year:'2-digit'})}
+function bindChart(pts,range){
+  var sv=$('#cs'),cl=$('#cl'),lb=$('#cv');if(!sv||!cl||!lb)return;
+  var W=320,P=6,cnt=pts.length;
+  var mv=function(e){var r=sv.getBoundingClientRect(),x=(e.clientX-r.left)/r.width*W,i=Math.max(0,Math.min(cnt-1,Math.round((x-P)/(W-2*P)*(cnt-1))));
+    var p=pts[i],xx=P+i*(W-2*P)/Math.max(1,cnt-1);cl.setAttribute('x1',xx);cl.setAttribute('x2',xx);cl.style.display='';
+    lb.textContent='₹'+n(p[1])+' · '+fmtT(p[0],range)+(p[2]?' · Vol '+vf(p[2]):'')};
+  sv.onpointermove=mv;sv.onpointerdown=mv;
+}
+function loadChart(sym){
+  var rg=$('#rg'),ch=$('#ch'),cv=$('#cv');if(!rg||!ch)return;
+  var R=[['1d','1D'],['1m','1M'],['6m','6M'],['1y','1Y']];
+  rg.innerHTML=R.map(function(x){return'<button data-r="'+x[0]+'" class="'+(crange===x[0]?'on':'')+'">'+x[1]+'</button>'}).join('');
+  rg.onclick=function(e){var b=e.target.closest('button');if(b){crange=b.dataset.r;loadChart(sym)}};
+  ch.innerHTML='<div class="sk" style="height:130px"></div>';if(cv)cv.textContent='';
+  if(cctl)cctl.abort();cctl=new AbortController();
+  api('/api/chart/'+encodeURIComponent(sym)+'?range='+crange,null,cctl.signal).then(function(d){
+    var c2=$('#ch'),v2=$('#cv');if(!c2)return;
+    if(!d.points.length){c2.innerHTML='<p class="mut">No chart data for this range.</p>';return}
+    var a=d.points[0][1],b=d.points[d.points.length-1][1];
+    c2.innerHTML=chartSvg(d.points,b>=a);bindChart(d.points,crange);
+    if(v2)v2.textContent='Range change: '+(b>=a?'+':'')+((b-a)/a*100).toFixed(2)+'% · touch the chart to inspect';
+  }).catch(function(e){var c3=$('#ch');if(c3&&!isAbort(e))c3.innerHTML='<p class="mut">Chart unavailable: '+esc(e.message)+'</p>'});
+}
 /* detail */
 function openDetail(sym){
   var m=$('#modal'),b=$('#mb');if(!m||!b)return;
@@ -460,15 +543,16 @@ function openDetail(sym){
     b.innerHTML='<div style="display:flex;justify-content:space-between"><div><b style="font-size:20px">'+esc(s.symbol)+'</b><div class="mut">'+esc(s.companyName||'')+'</div></div><button id="x">✕</button></div>'+
       '<div style="font-size:32px;margin:12px 0">₹'+n(s.currentPrice)+' <span class="'+c+'" style="font-size:16px">'+n(s.change)+' ('+n(s.percentChange)+'%)</span></div>'+
       '<div class="mut">Day range: ₹'+n(s.dayLow)+' – ₹'+n(s.dayHigh)+'</div>'+
-      '<div class="mut" style="margin-top:10px">52-week range</div><div class="bar"><i style="left:'+pos+'%"></i></div><div class="mut" style="display:flex;justify-content:space-between"><span>₹'+n(s.week52Low)+'</span><span>₹'+n(s.week52High)+'</span></div>'+
+      '<div class="chips" id="rg" style="margin-top:12px"></div><div id="ch" style="min-height:130px"></div><div id="cv" class="mut" style="font-size:12px;min-height:16px;margin-bottom:4px"></div><div class="mut" style="margin-top:10px">52-week range</div><div class="bar"><i style="left:'+pos+'%"></i></div><div class="mut" style="display:flex;justify-content:space-between"><span>₹'+n(s.week52Low)+'</span><span>₹'+n(s.week52High)+'</span></div>'+
       '<div class="mut" style="margin-top:12px">Volume today</div><div style="display:flex;justify-content:space-between;align-items:baseline"><b style="font-size:20px">'+vf(s.volume)+'</b><span class="mut">'+(rel?rel.toFixed(1)+'× typical':'')+'</span></div><div class="vol big'+(rel>=2?' hot':'')+'"><i style="width:'+vw+'%"></i></div><p class="mut" style="margin-top:10px">Updated: '+esc(s.lastUpdated||'–')+' · Data: '+esc(s.dataStatus)+(s.source==='stale'?' · updating':'')+'</p>'+
       '<button id="w" style="margin-top:14px;width:100%">'+(on?'Remove from watchlist':'Add to watchlist')+'</button>';
+    loadChart(s.symbol);
     var x=$('#x'),w=$('#w');
     if(x)x.onclick=closeDetail;
     if(w)w.onclick=function(){var i=wl.indexOf(s.symbol);if(i>-1)wl.splice(i,1);else wl.push(s.symbol);saveWl();closeDetail();if(tab==='wl')wlv()};
   }).catch(function(e){var bb=$('#mb');if(bb)bb.innerHTML='<div class="err">'+esc(e.message)+'<br><br><button onclick="closeDetail()">Close</button></div>'});
 }
-function closeDetail(){var m=$('#modal');if(m)m.style.display='none';viewing=null}
+function closeDetail(){if(cctl)cctl.abort();var m=$('#modal');if(m)m.style.display='none';viewing=null}
 
 /* chat */
 function chatInit(){
