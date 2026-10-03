@@ -72,7 +72,14 @@ async function getStock(sym) {
     if (!nseBudget.can()) { if (old) return { ...old, source: "stale" }; throw fail("RATE_LIMITED", "Daily NSE call budget used up and nothing cached yet.", 429); }
     let raw, err;
     for (let i = 0; i <= 2 && !raw; i++) {
-      try { raw = await tmo(nse.getEquityDetails(sym), C.timeout); }
+      try {
+        const [det, ti] = await Promise.all([
+          tmo(nse.getEquityDetails(sym), C.timeout),
+          typeof nse.getEquityTradeInfo === "function" ? tmo(nse.getEquityTradeInfo(sym), C.timeout).catch(() => null) : null,
+        ]);
+        raw = det;
+        if (ti && ti.marketDeptOrderBook && raw && typeof raw === "object" && !raw.marketDeptOrderBook) raw.marketDeptOrderBook = ti.marketDeptOrderBook;
+      }
       catch (e) {
         err = e;
         lastNseError = { at: new Date().toISOString(), symbol: sym, status: (e && e.response && e.response.status) || null, message: String((e && e.message) || e).slice(0, 200) };
@@ -92,12 +99,18 @@ let universe = C.U.slice();
 let loadedIndex = null, indexError = null;
 async function loadIndex(name) {
   if (!nseBudget.can()) throw fail("RATE_LIMITED", "Daily NSE call budget used up.", 429);
-  const call = typeof nse.getEquityStockIndices === "function"
-    ? nse.getEquityStockIndices(name)
-    : nse.getDataByEndpoint("/api/equity-stockIndices?index=" + encodeURIComponent(name));
-  const raw = await tmo(call, Math.max(C.timeout, 25000));
-  const arr = raw && Array.isArray(raw.data) ? raw.data : null;
-  if (!arr) throw fail("INVALID_PROVIDER_RESPONSE", "Index response had no data (keys: " + Object.keys(raw || {}).slice(0, 6).join(",") + ").", 502);
+  const attempts = [];
+  if (typeof nse.getEquityStockIndices === "function") attempts.push(() => nse.getEquityStockIndices(name));
+  attempts.push(() => nse.getDataByEndpoint("/api/equity-stockIndices?index=" + encodeURIComponent(name)));
+  let raw = null, arr = null, lastE = null;
+  for (const run of attempts) {
+    try { raw = await tmo(run(), Math.max(C.timeout, 25000)); arr = raw && Array.isArray(raw.data) && raw.data.length > 1 ? raw.data : null; if (arr) break; }
+    catch (e) { lastE = e; }
+  }
+  if (!arr) {
+    if (lastE && !raw) throw lastE;
+    throw fail("INVALID_PROVIDER_RESPONSE", "Index had no stocks (rows: " + ((raw && Array.isArray(raw.data) && raw.data.length) || 0) + ", keys: " + Object.keys(raw || {}).slice(0, 6).join(",") + ").", 502);
+  }
   const syms = [];
   for (const it of arr) {
     const meta = (it && it.meta) || {}, sym = it && (it.symbol || meta.symbol);
@@ -383,6 +396,16 @@ app.get("/api/debug/nse", h(async (q) => {
   out.universeSize = universe.length;
   out.lastNseError = lastNseError; out.nseBudgetUsed = nseBudget.u;
   return out;
+}));
+app.get("/api/debug/raw", h(async (q) => {
+  const pth = String(q.query.path || "");
+  if (!pth.startsWith("/api/") || pth.length > 200) throw fail("INVALID_PARAMETERS", 'Use ?path=/api/... (NSE endpoint path).', 400);
+  const t = Date.now();
+  try {
+    const r = await tmo(nse.getDataByEndpoint(pth), 25000);
+    const txt = JSON.stringify(r) || "";
+    return { ok: true, ms: Date.now() - t, type: Array.isArray(r) ? "array" : typeof r, keys: r && typeof r === "object" ? Object.keys(r).slice(0, 15) : null, dataRows: r && Array.isArray(r.data) ? r.data.length : null, bytes: txt.length, preview: txt.slice(0, 500) };
+  } catch (e) { return { ok: false, ms: Date.now() - t, status: (e && e.response && e.response.status) || null, message: String((e && e.message) || e).slice(0, 200) }; }
 }));
 app.get("/api/market-status", h(marketStatus));
 app.get("/api/stocks", h(async () => {
