@@ -8,7 +8,7 @@ const { NseIndia } = require("stock-nse-india");
 /* ---------- CONFIG ---------- */
 const env = (k, d) => { const v = process.env[k]; const n = Number(v); return v && Number.isFinite(n) ? n : d; };
 const C = {
-  port: env("PORT", 3000), ttl: env("QUOTE_CACHE_TTL", 240000), conc: env("MAX_CONCURRENCY", 6),
+  port: env("PORT", 3000), ttl: env("QUOTE_CACHE_TTL", 240000), conc: env("MAX_CONCURRENCY", 5), timeout: env("NSE_TIMEOUT", 15000),
   refresh: env("REFRESH_INTERVAL_MS", 240000), groqKey: process.env.GROQ_API_KEY || null,
   model: process.env.GROQ_MODEL || "openai/gpt-oss-120b",
   U: ["TCS","RELIANCE","HDFCBANK","INFY","ICICIBANK","BHARTIARTL","SBIN","ITC","LT","KOTAKBANK","HINDUNILVR","AXISBANK","BAJFINANCE","MARUTI","ASIANPAINT","WIPRO","TITAN","SUNPHARMA","NTPC","ADANIENT","ULTRACEMCO","POWERGRID","NESTLEIND","TATAMOTORS","JSWSTEEL"],
@@ -71,8 +71,8 @@ async function getStock(sym) {
     const old = stale(k);
     if (!nseBudget.can()) { if (old) return { ...old, source: "stale" }; throw fail("RATE_LIMITED", "Daily NSE call budget used up and nothing cached yet.", 429); }
     let raw, err;
-    for (let i = 0; i <= 1 && !raw; i++) {
-      try { raw = await tmo(nse.getEquityDetails(sym), 7000); }
+    for (let i = 0; i <= 2 && !raw; i++) {
+      try { raw = await tmo(nse.getEquityDetails(sym), C.timeout); }
       catch (e) {
         err = e;
         lastNseError = { at: new Date().toISOString(), symbol: sym, status: (e && e.response && e.response.status) || null, message: String((e && e.message) || e).slice(0, 200) };
@@ -90,7 +90,7 @@ async function getStock(sym) {
 /* Stale-while-revalidate: always answer instantly from cache; refresh in the background. */
 let bg = null, lastBg = 0;
 function refreshStale() {
-  if (bg || Date.now() - lastBg < 20000) return bg;
+  if (bg || Date.now() - lastBg < 8000) return bg;
   const need = C.U.filter((x) => !cget("s:" + x));
   if (!need.length) return null;
   lastBg = Date.now();
