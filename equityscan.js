@@ -97,7 +97,12 @@ function refreshStale() {
   bg = pool(need, C.conc, (x) => getStock(x).catch(() => null)).finally(() => { bg = null; });
   return bg;
 }
-const have = () => C.U.map((x) => { const f = cget("s:" + x); const v = f || stale("s:" + x); return v ? { ...v, source: f ? "cache" : "stale" } : null; }).filter(Boolean);
+const have = () => {
+  const list = C.U.map((x) => { const f = cget("s:" + x); const v = f || stale("s:" + x); return v ? { ...v, source: f ? "cache" : "stale" } : null; }).filter(Boolean);
+  const vols = list.map((r) => r.volume).filter((v) => v > 0).sort((a, b) => a - b);
+  const med = vols.length ? vols[Math.floor(vols.length / 2)] : null;
+  return list.map((r) => ({ ...r, relVolume: med && r.volume ? Number((r.volume / med).toFixed(2)) : null }));
+};
 async function allStocks() {
   let rows = have();
   const p = refreshStale();
@@ -158,7 +163,7 @@ async function groq(messages, maxTokens, retry = true) {
 }
 
 /* ---------- NATURAL-LANGUAGE QUERY ---------- */
-const FIELDS = { currentPrice: "price in INR", percentChange: "today's % change", volume: "shares traded today", week52High: "52-week high", week52Low: "52-week low", highPercent: "price as % of 52-week high (0-100)" };
+const FIELDS = { currentPrice: "price in INR", percentChange: "today's % change", volume: "shares traded today", week52High: "52-week high", week52Low: "52-week low", highPercent: "price as % of 52-week high (0-100)", relVolume: "volume relative to the typical (median) stock in the app; 1 = typical, 2 = twice as busy" };
 const OPS = ["<", ">", "<=", ">="];
 const QPROMPT = 'Convert a stock search into JSON only (no prose, no code fences): {"sector":string|null,"filters":[{"field":string,"op":"<"|">"|"<="|">=","value":number}],"sortBy":string|null,"sortDir":"asc"|"desc","limit":number|null,"unsupported":[string]}. Allowed fields: ' +
   Object.entries(FIELDS).map(([k, v]) => k + " (" + v + ")").join("; ") +
@@ -273,6 +278,25 @@ button{font:inherit;color:var(--t);border:1px solid rgba(255,255,255,.25);backgr
 #chat{right:12px;left:12px;bottom:calc(150px + env(safe-area-inset-bottom));max-width:420px;margin-left:auto;padding:14px;max-height:55vh;flex-direction:column}
 #log{overflow:auto;flex:1;margin-bottom:10px;font-size:14px}#log p{margin:6px 0}#log .u{color:var(--g)}
 .err{padding:16px;text-align:center}
+body{font-variant-numeric:tabular-nums}
+.row{display:grid;grid-template-columns:1fr auto;gap:6px 12px;align-items:center}
+.row .l b{font-size:16px}.row .l small{display:block;margin-top:2px}
+.row .r{text-align:right;display:flex;flex-direction:column;align-items:flex-end;gap:4px}
+.pr{font-size:16px;font-weight:600}
+.pill{font-size:12px;font-weight:600;padding:2px 8px;border-radius:99px;background:rgba(255,255,255,.1)}
+.pill.up{background:rgba(46,230,166,.16)}.pill.dn{background:rgba(255,107,129,.16)}
+.vol{grid-column:1/-1;position:relative;height:18px;border-radius:9px;background:rgba(255,255,255,.07);overflow:hidden}
+.vol i{position:absolute;left:0;top:0;bottom:0;border-radius:9px;background:linear-gradient(90deg,rgba(31,182,201,.55),rgba(46,230,166,.55))}
+.vol.hot i{background:linear-gradient(90deg,rgba(255,184,77,.7),rgba(255,107,129,.7))}
+.vol em{position:relative;font-style:normal;font-size:11px;line-height:18px;padding-left:8px}
+.vol.big{height:10px;margin:6px 0}
+.sum{display:flex;justify-content:space-around;text-align:center;padding:14px 8px;margin-bottom:8px}
+.sum small{display:block;color:var(--m);font-size:11px}.sum b{font-size:20px}
+.split{height:6px;border-radius:9px;background:var(--r);margin:0 4px 10px;overflow:hidden}.split i{display:block;height:100%;background:var(--g)}
+.chips{display:flex;gap:8px;overflow-x:auto;padding:4px 0 10px;scrollbar-width:none}.chips::-webkit-scrollbar{display:none}
+.chips button{white-space:nowrap;padding:7px 12px;font-size:13px;border-radius:99px}
+.chips button.on{background:rgba(46,230,166,.22);border-color:rgba(46,230,166,.5)}
+#tabs button{display:flex;flex-direction:column;align-items:center;gap:2px;font-size:11px}#tabs button span{font-size:17px;line-height:1}
 </style></head><body>
 <div id="app">
 <header class="glass"><div><b>EquityScan</b><small>MARKET INTELLIGENCE</small></div><span id="mk">Checking…</span></header>
@@ -285,7 +309,8 @@ button{font:inherit;color:var(--t);border:1px solid rgba(255,255,255,.25);backgr
 <div id="modal"><div class="box glass" id="mb"></div></div>
 <script>
 var $=function(s){return document.querySelector(s)};
-var TABS=[['dash','Dashboard'],['scr','Screener'],['mkt','Markets'],['wl','Watchlist']];
+var TABS=[['dash','Dashboard','▦'],['scr','Screener','⌕'],['mkt','Markets','≋'],['wl','Watchlist','★']];
+var maxVol=1,msort='volume';
 var tab='dash',ctl=null,rows=[],viewing=null,wl=[];
 try{wl=JSON.parse(localStorage.getItem('wl')||'[]')}catch(e){}
 function saveWl(){try{localStorage.setItem('wl',JSON.stringify(wl))}catch(e){}}
@@ -298,9 +323,13 @@ function api(p,body,sig){
 }
 function skel(){return '<div class="sk"></div><div class="sk"></div><div class="sk"></div><div class="sk"></div>'}
 function errBox(e,retry){return '<div class="err glass"><p>'+esc(e.message)+'</p><br><button onclick="'+retry+'()">Retry</button></div>'}
+function vf(v){if(v==null)return '–';if(v>=1e7)return (v/1e7).toFixed(2)+' Cr';if(v>=1e5)return (v/1e5).toFixed(2)+' L';if(v>=1e3)return (v/1e3).toFixed(1)+' K';return String(v)}
+function calcMax(){maxVol=Math.max.apply(null,rows.map(function(v){return v.volume||0}).concat([1]))}
 function row(s){
-  var c=(s.percentChange||0)>=0?'up':'dn',sg=(s.percentChange||0)>=0?'+':'';
-  return '<div class="row glass" data-s="'+esc(s.symbol)+'"><b>'+esc(s.symbol)+'</b><span class="p">₹'+n(s.currentPrice)+'</span><small>'+esc(s.companyName||s.sector||'')+(s.source==='stale'?' · updating':'')+'</small><span class="p '+c+'">'+sg+n(s.percentChange)+'%</span></div>';
+  var up=(s.percentChange||0)>=0,rel=s.relVolume,w=Math.min(100,(s.volume||0)/maxVol*100);
+  return '<div class="row glass" data-s="'+esc(s.symbol)+'"><div class="l"><b>'+esc(s.symbol)+'</b><small>'+esc(s.companyName||s.sector||'')+(s.source==='stale'?' · updating':'')+'</small></div>'+
+    '<div class="r"><span class="pr">₹'+n(s.currentPrice)+'</span><span class="pill '+(up?'up':'dn')+'">'+(up?'+':'')+n(s.percentChange)+'%</span></div>'+
+    '<div class="vol'+(rel>=2?' hot':'')+'"><i style="width:'+w+'%"></i><em>Vol '+vf(s.volume)+(rel>=1.5?' · '+rel.toFixed(1)+'× busy':'')+'</em></div></div>';
 }
 function setView(h){var v=$('#view');if(v)v.innerHTML=h}
 function loadRows(sig){return api('/api/stocks',null,sig).then(function(d){rows=d.rows;return rows})}
@@ -308,7 +337,7 @@ function isAbort(e){return e&&e.name==='AbortError'}
 
 function poll(sig,render,tries){
   return api('/api/stocks',null,sig).then(function(d){
-    rows=d.rows;render(d);
+    rows=d.rows;calcMax();render(d);
     if(d.loading>0&&(tries||0)<24&&!sig.aborted)return new Promise(function(r){setTimeout(r,2500)}).then(function(){if(!sig.aborted)return poll(sig,render,(tries||0)+1)});
   });
 }
@@ -319,17 +348,26 @@ function dash(){
   poll(sig,function(d){
     if(tab!=='dash')return;var r=d.rows;
     if(!r.length){setView(waiting(d,'dash'));return}
-    var by=function(k,dir){return r.slice().sort(function(a,b){return((a[k]||0)-(b[k]||0))*dir}).slice(0,4).map(row).join('')};
-    setView('<h3>Top gainers</h3>'+by('percentChange',-1)+'<h3>Top losers</h3>'+by('percentChange',1)+'<h3>Most active</h3>'+by('volume',-1)+more(d));
+    var adv=0,dec=0,tot=0;r.forEach(function(x){if(x.percentChange>0)adv++;else if(x.percentChange<0)dec++;tot+=x.volume||0});
+    var pct=adv+dec?adv/(adv+dec)*100:50;
+    var by=function(k,dir,min){return r.filter(function(x){return min==null||(x[k]||0)>=min}).sort(function(a,b){return((a[k]||0)-(b[k]||0))*dir}).slice(0,4).map(row).join('')};
+    var surge=by('relVolume',-1,1.5);
+    setView('<div class="sum glass"><div><small>Advancing</small><b class="up">'+adv+'</b></div><div><small>Declining</small><b class="dn">'+dec+'</b></div><div><small>Total volume</small><b>'+vf(tot)+'</b></div></div><div class="split"><i style="width:'+pct+'%"></i></div>'+
+      '<h3>Top gainers</h3>'+by('percentChange',-1)+'<h3>Top losers</h3>'+by('percentChange',1)+'<h3>Most active by volume</h3>'+by('volume',-1)+(surge?'<h3>Volume surge (busier than usual)</h3>'+surge:'')+more(d));
   }).catch(function(e){if(!isAbort(e))setView(errBox(e,'dash'))});
 }
 function mkt(){
-  setView('<input id="f" placeholder="Search symbol or company"><div id="list" style="margin-top:12px">'+skel()+'</div>');
+  var SORTS=[['volume','Volume'],['percentChange','% Change'],['currentPrice','Price'],['symbol','A–Z']];
+  setView('<input id="f" placeholder="Search symbol or company"><div class="chips" id="sc" style="margin-top:10px"></div><div id="list">'+skel()+'</div>');
   var lastD=null;
-  var draw=function(d){if(d)lastD=d;var f=$('#f'),l=$('#list');if(!f||!l)return;var q=f.value.toLowerCase();
-    var h=rows.filter(function(s){return(s.symbol+' '+(s.companyName||'')).toLowerCase().indexOf(q)>-1}).map(row).join('');
+  var draw=function(d){if(d)lastD=d;var f=$('#f'),l=$('#list'),sc=$('#sc');if(!f||!l||!sc)return;var q=f.value.toLowerCase();
+    sc.innerHTML=SORTS.map(function(x){return'<button data-k="'+x[0]+'" class="'+(msort===x[0]?'on':'')+'">'+x[1]+'</button>'}).join('');
+    var list=rows.filter(function(x){return(x.symbol+' '+(x.companyName||'')).toLowerCase().indexOf(q)>-1});
+    list.sort(function(a,b){return msort==='symbol'?a.symbol.localeCompare(b.symbol):(b[msort]||0)-(a[msort]||0)});
+    var h=list.map(row).join('');
     l.innerHTML=(h||(!rows.length&&lastD?waiting(lastD,'mkt'):'<p class="mut">No matches.</p>'))+more(lastD)};
-  var f=$('#f');if(f)f.oninput=function(){draw()};
+  var f=$('#f'),sc=$('#sc');if(f)f.oninput=function(){draw()};
+  if(sc)sc.onclick=function(e){var b=e.target.closest('button');if(b){msort=b.dataset.k;draw()}};
   poll(newSignal(),function(d){if(tab==='mkt')draw(d)}).catch(function(e){var l=$('#list');if(l&&!isAbort(e))l.innerHTML=errBox(e,'mkt')});
 }
 function wlv(){
@@ -341,13 +379,14 @@ function wlv(){
   }).catch(function(e){if(!isAbort(e))setView(errBox(e,'wlv'))});
 }
 function scr(){
-  setView('<input id="q" placeholder="Try: banks under 1500 rupees near 52-week high"><div style="margin:10px 0"><button id="go">Search</button></div><div id="out"></div>');
+  setView('<input id="q" placeholder="Try: busy banks under 1500 rupees"><div style="margin:10px 0"><button id="go">Search</button></div><div class="chips" id="eg"></div><div id="out"></div>');
+  var EX=['High volume stocks','Top gainers above 2%','Busy banks','Near 52-week high','Quiet stocks under 1000 rupees'];
   var go=$('#go'),q=$('#q');
   var run=function(){
     var out=$('#out');if(!q||!out||!q.value.trim())return;
     out.innerHTML=skel();
     api('/api/query',{query:q.value.trim()},newSignal()).then(function(d){
-      var o=$('#out');if(!o||tab!=='scr')return;var i=d.interpreted,chips='';
+      var o=$('#out');if(!o||tab!=='scr')return;var i=d.interpreted,chips='';if(d.results.length)maxVol=Math.max.apply(null,d.results.map(function(v){return v.volume||0}).concat([1]));
       if(i.sector)chips+='<span class="chip">sector: '+esc(i.sector)+'</span>';
       i.filters.forEach(function(f){chips+='<span class="chip">'+esc(f.field)+' '+esc(f.op)+' '+n(f.value)+'</span>'});
       if(i.sortBy)chips+='<span class="chip">sort: '+esc(i.sortBy)+' '+i.sortDir+'</span>';
@@ -357,12 +396,13 @@ function scr(){
     }).catch(function(e){var o=$('#out');if(o&&!isAbort(e))o.innerHTML='<div class="err glass">'+esc(e.message)+'</div>'});
   };
   if(go)go.onclick=run;if(q)q.onkeydown=function(e){if(e.key==='Enter')run()};
+  var eg=$('#eg');if(eg){eg.innerHTML=EX.map(function(x){return'<button>'+x+'</button>'}).join('');eg.onclick=function(e){var b=e.target.closest('button');if(b&&q){q.value=b.textContent;run()}}}
 }
 var VIEWS={dash:dash,scr:scr,mkt:mkt,wl:wlv};
 function go(t){tab=t;if(ctl)ctl.abort();
   var nav=$('#tabs');if(nav)nav.querySelectorAll('button').forEach(function(b){b.className=b.dataset.t===t?'on':''});
   VIEWS[t]()}
-function drawTabs(){var nav=$('#tabs');if(!nav)return;nav.innerHTML=TABS.map(function(t){return'<button data-t="'+t[0]+'">'+t[1]+'</button>'}).join('');
+function drawTabs(){var nav=$('#tabs');if(!nav)return;nav.innerHTML=TABS.map(function(t){return'<button data-t="'+t[0]+'"><span>'+t[2]+'</span>'+t[1]+'</button>'}).join('');
   nav.onclick=function(e){var b=e.target.closest('button');if(b)go(b.dataset.t)}}
 
 /* detail */
@@ -372,12 +412,12 @@ function openDetail(sym){
   api('/api/stock/'+encodeURIComponent(sym)).then(function(s){
     if(m.style.display!=='flex')return;viewing=s;
     var pos=s.week52High&&s.week52Low&&s.week52High>s.week52Low?Math.max(0,Math.min(100,(s.currentPrice-s.week52Low)/(s.week52High-s.week52Low)*100)):50;
-    var c=(s.change||0)>=0?'up':'dn',on=wl.indexOf(s.symbol)>-1;
+    var c=(s.change||0)>=0?'up':'dn',on=wl.indexOf(s.symbol)>-1;var rr=rows.filter(function(x){return x.symbol===s.symbol})[0],rel=rr&&rr.relVolume,vw=Math.min(100,(s.volume||0)/maxVol*100);
     b.innerHTML='<div style="display:flex;justify-content:space-between"><div><b style="font-size:20px">'+esc(s.symbol)+'</b><div class="mut">'+esc(s.companyName||'')+'</div></div><button id="x">✕</button></div>'+
       '<div style="font-size:32px;margin:12px 0">₹'+n(s.currentPrice)+' <span class="'+c+'" style="font-size:16px">'+n(s.change)+' ('+n(s.percentChange)+'%)</span></div>'+
       '<div class="mut">Day range: ₹'+n(s.dayLow)+' – ₹'+n(s.dayHigh)+'</div>'+
       '<div class="mut" style="margin-top:10px">52-week range</div><div class="bar"><i style="left:'+pos+'%"></i></div><div class="mut" style="display:flex;justify-content:space-between"><span>₹'+n(s.week52Low)+'</span><span>₹'+n(s.week52High)+'</span></div>'+
-      '<p class="mut" style="margin-top:10px">Volume: '+n(s.volume,0)+' · Updated: '+esc(s.lastUpdated||'–')+' · Data: '+esc(s.dataStatus)+(s.source&&s.source!=='provider'?' · '+esc(s.source):'')+'</p>'+
+      '<div class="mut" style="margin-top:12px">Volume today</div><div style="display:flex;justify-content:space-between;align-items:baseline"><b style="font-size:20px">'+vf(s.volume)+'</b><span class="mut">'+(rel?rel.toFixed(1)+'× typical':'')+'</span></div><div class="vol big'+(rel>=2?' hot':'')+'"><i style="width:'+vw+'%"></i></div><p class="mut" style="margin-top:10px">Updated: '+esc(s.lastUpdated||'–')+' · Data: '+esc(s.dataStatus)+(s.source==='stale'?' · updating':'')+'</p>'+
       '<button id="w" style="margin-top:14px;width:100%">'+(on?'Remove from watchlist':'Add to watchlist')+'</button>';
     var x=$('#x'),w=$('#w');
     if(x)x.onclick=closeDetail;
