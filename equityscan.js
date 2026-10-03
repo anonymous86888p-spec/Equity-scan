@@ -146,6 +146,7 @@ async function loadIndexLadder() {
 /* ---------- YAHOO FINANCE (free, no key) - merged with NSE ---------- */
 const YF_LIST = ["ADANIENT","ADANIPORTS","APOLLOHOSP","ASIANPAINT","AXISBANK","BAJAJ-AUTO","BAJFINANCE","BAJAJFINSV","BEL","BHARTIARTL","CIPLA","COALINDIA","DRREDDY","EICHERMOT","ETERNAL","GRASIM","HCLTECH","HDFCBANK","HDFCLIFE","HEROMOTOCO","HINDALCO","HINDUNILVR","ICICIBANK","INDUSINDBK","INFY","ITC","JIOFIN","JSWSTEEL","KOTAKBANK","LT","M&M","MARUTI","NESTLEIND","NTPC","ONGC","POWERGRID","RELIANCE","SBILIFE","SBIN","SHRIRAMFIN","SUNPHARMA","TATACONSUM","TATAMOTORS","TATASTEEL","TCS","TECHM","TITAN","TRENT","ULTRACEMCO","WIPRO",
   "ABB","ADANIGREEN","ADANIPOWER","AMBUJACEM","BANKBARODA","BOSCHLTD","CANBK","CHOLAFIN","COLPAL","DABUR","DLF","DIVISLAB","GAIL","GODREJCP","HAVELLS","HAL","ICICIGI","ICICIPRULI","INDIGO","IOC","IRCTC","IRFC","JINDALSTEL","LICI","LODHA","LTIM","MARICO","MUTHOOTFIN","NAUKRI","PFC","PIDILITIND","PNB","RECLTD","SHREECEM","SIEMENS","SRF","TVSMOTOR","TORNTPHARM","UNIONBANK","UNITDSPR","VBL","VEDL","ZYDUSLIFE","BPCL","BERGEPAINT","CGPOWER","MAXHEALTH","POLYCAB","PERSISTENT"];
+let yahooBlockedAt = 0;
 let yfClient = null, yahooError = null, yahooRun = null, yahooAt = 0, yahooTry = 0;
 const yahooSyms = new Set();
 async function yahooClient() {
@@ -185,10 +186,11 @@ async function loadYahooQuotes() {
 }
 const YH = { "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Mobile Safari/537.36", Accept: "application/json" };
 async function yahooChartRaw(sym, range, interval) {
+  if (Date.now() - yahooBlockedAt < 10 * 60000) throw fail("PROVIDER_UNAVAILABLE", "Yahoo returned 429 (blocked recently)", 503);
   const ac = new AbortController(), t = setTimeout(() => ac.abort(), 15000);
   try {
     const r = await fetch("https://query1.finance.yahoo.com/v8/finance/chart/" + encodeURIComponent(sym) + ".NS?range=" + range + "&interval=" + interval, { headers: YH, signal: ac.signal });
-    if (!r.ok) throw fail("PROVIDER_UNAVAILABLE", "Yahoo returned " + r.status, 503);
+    if (!r.ok) { if (r.status === 429) yahooBlockedAt = Date.now(); throw fail("PROVIDER_UNAVAILABLE", "Yahoo returned " + r.status, 503); }
     const res = (((await r.json()) || {}).chart || {}).result;
     if (!res || !res[0]) throw fail("PROVIDER_UNAVAILABLE", "Yahoo had no data for " + sym, 503);
     return res[0];
@@ -247,6 +249,60 @@ async function yahooChart(sym, range) {
   return pts;
 }
 
+/* ---------- NSE BHAVCOPY: one free end-of-day file for the whole market ---------- */
+const bhavSyms = new Set();
+let bhavError = null, bhavRun = null, bhavAt = 0, bhavTry = 0;
+async function loadBhav() {
+  const ist = new Date(Date.now() + 19800000);
+  let lastErr = "no recent file found";
+  for (let back = 0; back < 7; back++) {
+    const d = new Date(ist.getTime() - back * 864e5);
+    const ds = String(d.getUTCDate()).padStart(2, "0") + String(d.getUTCMonth() + 1).padStart(2, "0") + d.getUTCFullYear();
+    const ac = new AbortController(), t = setTimeout(() => ac.abort(), 25000);
+    try {
+      const r = await fetch("https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_" + ds + ".csv", { headers: { "User-Agent": YH["User-Agent"], Referer: "https://www.nseindia.com/", Accept: "text/csv,*/*" }, signal: ac.signal });
+      if (r.status === 403 || r.status === 429) { lastErr = "HTTP " + r.status + " (blocked)"; break; }
+      if (!r.ok) { lastErr = "HTTP " + r.status; continue; }
+      const lines = (await r.text()).split(/\r?\n/);
+      const head = (lines[0] || "").split(",").map((x) => x.trim().toUpperCase());
+      const ix = (n) => head.indexOf(n);
+      if (ix("SYMBOL") < 0 || ix("CLOSE_PRICE") < 0) { lastErr = "unexpected file format"; continue; }
+      const rows = [];
+      for (let i = 1; i < lines.length; i++) {
+        const c = lines[i].split(",").map((x) => x.trim());
+        if (c.length < head.length || c[ix("SERIES")] !== "EQ") continue;
+        const close = num(c[ix("CLOSE_PRICE")]), prev = num(c[ix("PREV_CLOSE")]);
+        if (close === null) continue;
+        rows.push({ c, close, prev, turn: num(c[ix("TURNOVER_LACS")]) || 0 });
+      }
+      if (!rows.length) { lastErr = "file had no equity rows"; continue; }
+      rows.sort((a, b) => b.turn - a.turn);
+      bhavSyms.clear();
+      for (const { c, close, prev } of rows.slice(0, 500)) {
+        const sym = c[ix("SYMBOL")], ch = prev ? close - prev : null;
+        cset("b:" + sym, {
+          symbol: sym, companyName: null, sector: null, currentPrice: close, previousClose: prev,
+          change: ch === null ? null : Number(ch.toFixed(2)), percentChange: ch === null ? null : Number(((ch / prev) * 100).toFixed(2)),
+          open: num(c[ix("OPEN_PRICE")]), dayHigh: num(c[ix("HIGH_PRICE")]), dayLow: num(c[ix("LOW_PRICE")]), week52High: null, week52Low: null,
+          volume: num(c[ix("TTL_TRD_QNTY")]), lastUpdated: c[ix("DATE1")] || null, highPercent: null, dataStatus: "PARTIAL",
+        }, 6 * 3600000);
+        bhavSyms.add(sym);
+      }
+      return bhavSyms.size;
+    } catch (e) { lastErr = String((e && e.message) || e).slice(0, 100); }
+    finally { clearTimeout(t); }
+  }
+  throw fail("PROVIDER_UNAVAILABLE", lastErr, 503);
+}
+function refreshBhav() {
+  if (bhavRun || Date.now() - bhavTry < 60000 || Date.now() - bhavAt < 30 * 60000) return bhavRun;
+  bhavTry = Date.now();
+  bhavRun = loadBhav().then(() => { bhavAt = Date.now(); bhavError = null; })
+    .catch((e) => { bhavError = String((e && e.message) || e).slice(0, 140); console.warn("[EquityScan] Bhavcopy failed:", bhavError); })
+    .finally(() => { bhavRun = null; });
+  return bhavRun;
+}
+
 /* Stale-while-revalidate: always answer instantly from cache; refresh in the background. */
 let bg = null, lastBg = 0;
 function refreshStale() {
@@ -263,10 +319,11 @@ function refreshStale() {
 }
 const have = () => {
   const list = [];
-  for (const x of new Set([...universe, ...yahooSyms])) {
-    const f = cget("s:" + x), nv = f || stale("s:" + x), yf = cget("y:" + x), yv = yf || stale("y:" + x), base = nv || yv;
+  for (const x of new Set([...universe, ...yahooSyms, ...bhavSyms])) {
+    const f = cget("s:" + x), nv = f || stale("s:" + x), yf = cget("y:" + x), yv = yf || stale("y:" + x), bf = cget("b:" + x), bv = bf || stale("b:" + x), base = nv || yv || bv;
     if (!base) continue;
-    list.push({ ...base, marketCap: yv ? yv.marketCap : null, pe: yv ? yv.pe : null, via: nv ? "NSE" : "Yahoo", source: nv ? (f ? "cache" : "stale") : (yf ? "cache" : "stale") });
+    list.push({ ...base, marketCap: yv ? yv.marketCap : null, pe: yv ? yv.pe : null,
+      via: nv ? "NSE" : yv ? "Yahoo" : "EOD", source: nv ? (f ? "cache" : "stale") : yv ? (yf ? "cache" : "stale") : (bf ? "cache" : "stale") });
   }
   const vols = list.map((r) => r.volume).filter((v) => v > 0).sort((a, b) => a - b);
   const med = vols.length ? vols[Math.floor(vols.length / 2)] : null;
@@ -274,7 +331,7 @@ const have = () => {
 };
 async function allStocks() {
   let rows = have();
-  const ps = [refreshStale(), refreshYahoo()].filter(Boolean);
+  const ps = [refreshStale(), refreshYahoo(), refreshBhav()].filter(Boolean);
   if (ps.length && rows.length < universe.length / 2) { await Promise.race([Promise.all(ps), sleep(10000)]); rows = have(); }
   return rows;
 }
@@ -392,7 +449,7 @@ app.get("/api/debug/nse", h(async (q) => {
   t = Date.now();
   try { const yq = await tmo((await yahooClient()).quote([sym + ".NS"], {}, { validateResult: false }), 20000); const q0 = Array.isArray(yq) ? yq[0] : yq; out.yahooQuote = { ok: !!q0, ms: Date.now() - t, marketCap: q0 ? q0.marketCap : null, pe: q0 ? q0.trailingPE : null }; }
   catch (e) { out.yahooQuote = { ...fmt(e), ms: Date.now() - t }; }
-  out.yahooSymbols = yahooSyms.size; out.yahooError = yahooError;
+  out.bhavSymbols = bhavSyms.size; out.bhavError = bhavError; out.yahooSymbols = yahooSyms.size; out.yahooError = yahooError;
   out.universeSize = universe.length;
   out.lastNseError = lastNseError; out.nseBudgetUsed = nseBudget.u;
   return out;
@@ -409,13 +466,13 @@ app.get("/api/debug/raw", h(async (q) => {
 }));
 app.get("/api/market-status", h(marketStatus));
 app.get("/api/stocks", h(async () => {
-  refreshStale(); refreshYahoo();
-  const rows = have(), mix = { NSE: 0, Yahoo: 0 };
+  refreshStale(); refreshYahoo(); refreshBhav();
+  const rows = have(), mix = { NSE: 0, Yahoo: 0, EOD: 0 };
   rows.forEach((r) => { mix[r.via]++; });
   return {
     rows, loading: Math.max(0, universe.length - rows.length), total: Math.max(universe.length, rows.length), mix,
     index: loadedIndex && universe.length > C.U.length ? loadedIndex : null, indexError,
-    yahooError: yahooSyms.size ? null : yahooError, error: rows.length ? null : lastNseError,
+    yahooError: yahooSyms.size ? null : yahooError, bhavError: bhavSyms.size ? null : bhavError, error: rows.length ? null : lastNseError,
   };
 }));
 
@@ -437,26 +494,32 @@ app.get("/api/chart/:symbol", h(async (q) => {
   return dedupe(k, async () => {
     if (!nseBudget.can()) { const old = stale(k); if (old) return old; throw fail("RATE_LIMITED", "Daily NSE call budget used up.", 429); }
     let pts;
-    try {
+    const viaNse = (async () => {
+      let r;
       if (range === "1d") {
-        const raw = await tmo(nse.getEquityIntradayData(sym), C.timeout);
+        const raw = await tmo(nse.getEquityIntradayData(sym), 9000);
         const g = (raw && (raw.grapthData || raw.graphData)) || [];
-        pts = g.map((r) => [Number(r[0]), Number(r[1])]).filter((r) => Number.isFinite(r[0]) && Number.isFinite(r[1]));
+        r = g.map((x) => [Number(x[0]), Number(x[1])]).filter((x) => Number.isFinite(x[0]) && Number.isFinite(x[1]));
       } else {
         const days = { "1m": 31, "6m": 183, "1y": 366 }[range];
-        const raw = await tmo(nse.getEquityHistoricalData(sym, { start: new Date(Date.now() - days * 864e5), end: new Date() }), Math.max(C.timeout, 25000));
+        const raw = await tmo(nse.getEquityHistoricalData(sym, { start: new Date(Date.now() - days * 864e5), end: new Date() }), 18000);
         const pages = Array.isArray(raw) ? raw : [raw];
         const rows = [].concat(...pages.map((pg) => (pg && pg.data) || []));
-        pts = rows.map((r) => [Date.parse(r.CH_TIMESTAMP || r.mTIMESTAMP || r.date), Number(r.CH_CLOSING_PRICE ?? r.close), Number(r.CH_TOT_TRADED_QTY ?? r.volume)])
-          .filter((r) => Number.isFinite(r[0]) && Number.isFinite(r[1])).sort((a, b) => a[0] - b[0])
-          .map((r) => (Number.isFinite(r[2]) ? r : [r[0], r[1]]));
+        r = rows.map((x) => [Date.parse(x.CH_TIMESTAMP || x.mTIMESTAMP || x.date), Number(x.CH_CLOSING_PRICE ?? x.close), Number(x.CH_TOT_TRADED_QTY ?? x.volume)])
+          .filter((x) => Number.isFinite(x[0]) && Number.isFinite(x[1])).sort((x, y) => x[0] - y[0])
+          .map((x) => (Number.isFinite(x[2]) ? x : [x[0], x[1]]));
       }
-    } catch (e) {
+      if (!r.length) throw fail("PROVIDER_UNAVAILABLE", "NSE returned no chart points.", 503);
+      return r;
+    })();
+    const viaYahoo = yahooChart(sym, range);
+    viaNse.catch(() => {}); viaYahoo.catch(() => {});
+    try { pts = await Promise.any([viaNse, viaYahoo]); }
+    catch (e) {
       const old = stale(k); if (old) return old;
-      try { pts = await yahooChart(sym, range); }
-      catch (e2) { throw e && e.code ? e : fail("PROVIDER_UNAVAILABLE", "Chart data unavailable: " + String((e && e.message) || e).slice(0, 120), 503); }
+      const first = e && e.errors && e.errors[0];
+      throw first && first.code ? first : fail("PROVIDER_UNAVAILABLE", "Chart data unavailable: " + String((first && first.message) || e).slice(0, 120), 503);
     }
-    if (!pts.length) { try { pts = await yahooChart(sym, range); } catch (e3) {} }
     if (pts.length > 120) {
       const step = Math.ceil(pts.length / 120), out = [];
       for (let i = 0; i < pts.length; i += step) {
@@ -571,7 +634,7 @@ function vf(v){if(v==null)return '–';if(v>=1e7)return (v/1e7).toFixed(2)+' Cr'
 function calcMax(){maxVol=Math.max.apply(null,rows.map(function(v){return v.volume||0}).concat([1]))}
 function row(s){
   var up=(s.percentChange||0)>=0,rel=s.relVolume,w=Math.min(100,(s.volume||0)/maxVol*100);
-  return '<div class="row glass" data-s="'+esc(s.symbol)+'"><div class="l"><b>'+esc(s.symbol)+'</b><small>'+esc(s.companyName||s.sector||'')+(s.via==='Yahoo'?' · Yahoo':'')+(s.source==='stale'?' · updating':'')+'</small></div>'+
+  return '<div class="row glass" data-s="'+esc(s.symbol)+'"><div class="l"><b>'+esc(s.symbol)+'</b><small>'+esc(s.companyName||s.sector||'')+(s.via&&s.via!=='NSE'?' · '+esc(s.via):'')+(s.source==='stale'?' · updating':'')+'</small></div>'+
     '<div class="r"><span class="pr">₹'+n(s.currentPrice)+'</span><span class="pill '+(up?'up':'dn')+'">'+(up?'+':'')+n(s.percentChange)+'%</span></div>'+
     '<div class="vol'+(rel>=2?' hot':'')+'"><i style="width:'+w+'%"></i><em>Vol '+vf(s.volume)+(rel>=1.5?' · '+rel.toFixed(1)+'× busy':'')+'</em></div></div>';
 }
@@ -597,7 +660,7 @@ function dash(){
     var by=function(k,dir,min){return r.filter(function(x){return min==null||(x[k]||0)>=min}).sort(function(a,b){return((a[k]||0)-(b[k]||0))*dir}).slice(0,4).map(row).join('')};
     var surge=by('relVolume',-1,1.5);
     setView('<div class="sum glass"><div><small>Advancing</small><b class="up">'+adv+'</b></div><div><small>Declining</small><b class="dn">'+dec+'</b></div><div><small>Total volume</small><b>'+vf(tot)+'</b></div></div><div class="split"><i style="width:'+pct+'%"></i></div>'+
-      '<p class="mut" style="text-align:center;margin:-4px 0 6px">Tracking '+r.length+' stocks'+(d.index?' · '+esc(d.index):'')+(d.mix&&d.mix.Yahoo?' · NSE '+d.mix.NSE+' + Yahoo '+d.mix.Yahoo:'')+'</p>'+(d.yahooError?'<p class="mut" style="text-align:center;margin:0 0 8px">Yahoo unavailable ('+esc(d.yahooError)+')</p>':'')+(d.indexError?'<p class="mut" style="text-align:center;margin:0 0 8px">Full list unavailable ('+esc(d.indexError)+')</p>':'')+'<h3>Top gainers</h3>'+by('percentChange',-1)+'<h3>Top losers</h3>'+by('percentChange',1)+'<h3>Most active by volume</h3>'+by('volume',-1)+(surge?'<h3>Volume surge (busier than usual)</h3>'+surge:'')+more(d));
+      '<p class="mut" style="text-align:center;margin:-4px 0 6px">Tracking '+r.length+' stocks'+(d.index?' · '+esc(d.index):'')+(d.mix?' · '+Object.keys(d.mix).filter(function(k){return d.mix[k]}).map(function(k){return k+' '+d.mix[k]}).join(' + '):'')+'</p>'+(d.yahooError?'<p class="mut" style="text-align:center;margin:0 0 8px">Yahoo unavailable ('+esc(d.yahooError)+')</p>':'')+(d.bhavError?'<p class="mut" style="text-align:center;margin:0 0 8px">End-of-day list unavailable ('+esc(d.bhavError)+')</p>':'')+(d.indexError?'<p class="mut" style="text-align:center;margin:0 0 8px">Full list unavailable ('+esc(d.indexError)+')</p>':'')+'<h3>Top gainers</h3>'+by('percentChange',-1)+'<h3>Top losers</h3>'+by('percentChange',1)+'<h3>Most active by volume</h3>'+by('volume',-1)+(surge?'<h3>Volume surge (busier than usual)</h3>'+surge:'')+more(d));
   }).catch(function(e){if(!isAbort(e))setView(errBox(e,'dash'))});
 }
 function mkt(){
@@ -732,7 +795,7 @@ app.listen(C.port, () => {
   const warm = async () => {
     try {
       const m = await marketStatus();
-      if (m.status !== "CLOSED" || !have().length) { refreshStale(); refreshYahoo(); }
+      if (m.status !== "CLOSED" || !have().length) { refreshStale(); refreshYahoo(); refreshBhav(); }
     } catch (e) {}
   };
   warm(); setInterval(warm, C.refresh);
