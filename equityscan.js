@@ -8,7 +8,7 @@ const { NseIndia } = require("stock-nse-india");
 /* ---------- CONFIG ---------- */
 const env = (k, d) => { const v = process.env[k]; const n = Number(v); return v && Number.isFinite(n) ? n : d; };
 const C = {
-  port: env("PORT", 3000), ttl: env("QUOTE_CACHE_TTL", 240000), conc: env("MAX_CONCURRENCY", 5), timeout: env("NSE_TIMEOUT", 15000),
+  port: env("PORT", 3000), ttl: env("QUOTE_CACHE_TTL", 240000), conc: env("MAX_CONCURRENCY", 5), timeout: env("NSE_TIMEOUT", 15000), index: process.env.INDEX_NAME || "NIFTY 500",
   refresh: env("REFRESH_INTERVAL_MS", 240000), groqKey: process.env.GROQ_API_KEY || null,
   model: process.env.GROQ_MODEL || "openai/gpt-oss-120b",
   U: ["TCS","RELIANCE","HDFCBANK","INFY","ICICIBANK","BHARTIARTL","SBIN","ITC","LT","KOTAKBANK","HINDUNILVR","AXISBANK","BAJFINANCE","MARUTI","ASIANPAINT","WIPRO","TITAN","SUNPHARMA","NTPC","ADANIENT","ULTRACEMCO","POWERGRID","NESTLEIND","TATAMOTORS","JSWSTEEL"],
@@ -87,18 +87,53 @@ async function getStock(sym) {
     cset(k, v, C.ttl); return { ...v, source: "provider" };
   });
 }
+/* ---------- BULK UNIVERSE: one NSE call returns every stock in an index ---------- */
+let universe = C.U.slice();
+async function loadIndex() {
+  if (!nseBudget.can()) throw fail("RATE_LIMITED", "Daily NSE call budget used up.", 429);
+  const call = typeof nse.getEquityStockIndices === "function"
+    ? nse.getEquityStockIndices(C.index)
+    : nse.getDataByEndpoint("/api/equity-stockIndices?index=" + encodeURIComponent(C.index));
+  const raw = await tmo(call, Math.max(C.timeout, 20000));
+  const arr = raw && Array.isArray(raw.data) ? raw.data : null;
+  if (!arr) throw fail("INVALID_PROVIDER_RESPONSE", "Index response had no data.", 502);
+  const syms = [];
+  for (const it of arr) {
+    if (!it || !it.symbol || it.priority === 1 || it.symbol === raw.name) continue;
+    const price = num(it.lastPrice), hi = num(it.yearHigh), lo = num(it.yearLow);
+    const k = "s:" + it.symbol, old = stale(k) || {}, meta = it.meta || {};
+    const got = [price, hi, lo].filter((x) => x !== null).length;
+    cset(k, {
+      symbol: it.symbol, companyName: meta.companyName || old.companyName || null, sector: meta.industry || old.sector || null,
+      currentPrice: price, previousClose: num(it.previousClose), change: num(it.change), percentChange: num(it.pChange),
+      open: num(it.open), dayHigh: num(it.dayHigh), dayLow: num(it.dayLow), week52High: hi, week52Low: lo,
+      volume: num(it.totalTradedVolume), lastUpdated: it.lastUpdateTime || raw.timestamp || null,
+      highPercent: price !== null && hi ? Number(((price / hi) * 100).toFixed(2)) : null,
+      dataStatus: got === 3 ? "COMPLETE" : got === 0 ? "UNAVAILABLE" : "PARTIAL",
+    }, C.ttl);
+    syms.push(it.symbol);
+  }
+  if (!syms.length) throw fail("INVALID_PROVIDER_RESPONSE", "Index had no stocks.", 502);
+  universe = syms; nseBudget.spend();
+  return syms.length;
+}
+
 /* Stale-while-revalidate: always answer instantly from cache; refresh in the background. */
 let bg = null, lastBg = 0;
 function refreshStale() {
   if (bg || Date.now() - lastBg < 8000) return bg;
-  const need = C.U.filter((x) => !cget("s:" + x));
-  if (!need.length) return null;
+  if (universe.every((x) => cget("s:" + x))) return null;
   lastBg = Date.now();
-  bg = pool(need, C.conc, (x) => getStock(x).catch(() => null)).finally(() => { bg = null; });
+  bg = loadIndex().catch(async (e) => {
+    lastNseError = { at: new Date().toISOString(), symbol: "INDEX", status: (e && e.response && e.response.status) || null, message: String((e && e.message) || e).slice(0, 200) };
+    console.warn("[EquityScan] index load failed, falling back to per-stock:", lastNseError.message);
+    const need = C.U.filter((x) => !cget("s:" + x));
+    await pool(need, C.conc, (x) => getStock(x).catch(() => null));
+  }).finally(() => { bg = null; });
   return bg;
 }
 const have = () => {
-  const list = C.U.map((x) => { const f = cget("s:" + x); const v = f || stale("s:" + x); return v ? { ...v, source: f ? "cache" : "stale" } : null; }).filter(Boolean);
+  const list = universe.map((x) => { const f = cget("s:" + x); const v = f || stale("s:" + x); return v ? { ...v, source: f ? "cache" : "stale" } : null; }).filter(Boolean);
   const vols = list.map((r) => r.volume).filter((v) => v > 0).sort((a, b) => a - b);
   const med = vols.length ? vols[Math.floor(vols.length / 2)] : null;
   return list.map((r) => ({ ...r, relVolume: med && r.volume ? Number((r.volume / med).toFixed(2)) : null }));
@@ -106,7 +141,7 @@ const have = () => {
 async function allStocks() {
   let rows = have();
   const p = refreshStale();
-  if (p && rows.length < C.U.length / 2) { await Promise.race([p, sleep(10000)]); rows = have(); }
+  if (p && rows.length < universe.length / 2) { await Promise.race([p, sleep(10000)]); rows = have(); }
   return rows;
 }
 
@@ -184,8 +219,9 @@ async function runQuery(text) {
     spec.filters.every((f) => { const v = r[f.field]; if (v === null || v === undefined) return false; return f.op === "<" ? v < f.value : f.op === ">" ? v > f.value : f.op === "<=" ? v <= f.value : v >= f.value; });
   let rows = (await allStocks()).filter(ok);
   if (spec.sortBy) rows.sort((a, b) => ((a[spec.sortBy] || 0) - (b[spec.sortBy] || 0)) * (spec.sortDir === "asc" ? 1 : -1));
-  if (spec.limit) rows = rows.slice(0, spec.limit);
-  return { interpreted: spec, matches: rows.length, results: rows };
+  const total = rows.length;
+  rows = rows.slice(0, spec.limit || 100);
+  return { interpreted: spec, matches: total, results: rows };
 }
 
 /* ---------- ROUTES ---------- */
@@ -211,6 +247,12 @@ app.get("/api/debug/nse", h(async (q) => {
     const m = await tmo(nse.getMarketStatus(), 12000);
     out.market = { ok: true, ms: Date.now() - t, keys: Object.keys(m || {}) };
   } catch (e) { out.market = { ...fmt(e), ms: Date.now() - t }; }
+  t = Date.now();
+  try {
+    const r = typeof nse.getEquityStockIndices === "function" ? await tmo(nse.getEquityStockIndices(C.index), 25000) : await tmo(nse.getDataByEndpoint("/api/equity-stockIndices?index=" + encodeURIComponent(C.index)), 25000);
+    out.index = { ok: true, name: C.index, ms: Date.now() - t, count: Array.isArray(r && r.data) ? r.data.length : null, sampleKeys: r && r.data && r.data[1] ? Object.keys(r.data[1]) : null, hasGetter: typeof nse.getEquityStockIndices === "function" };
+  } catch (e) { out.index = { ...fmt(e), ms: Date.now() - t, name: C.index }; }
+  out.universeSize = universe.length;
   out.lastNseError = lastNseError; out.nseBudgetUsed = nseBudget.u;
   return out;
 }));
@@ -218,7 +260,7 @@ app.get("/api/market-status", h(marketStatus));
 app.get("/api/stocks", h(async () => {
   refreshStale();
   const rows = have();
-  return { rows, loading: C.U.length - rows.length, total: C.U.length, error: rows.length ? null : lastNseError };
+  return { rows, loading: Math.max(0, universe.length - rows.length), total: universe.length, index: universe.length > C.U.length ? C.index : null, error: rows.length ? null : lastNseError };
 }));
 app.get("/api/stock/:symbol", h(async (q) => {
   const sym = String(q.params.symbol || "").trim().toUpperCase();
@@ -310,7 +352,7 @@ body{font-variant-numeric:tabular-nums}
 <script>
 var $=function(s){return document.querySelector(s)};
 var TABS=[['dash','Dashboard','▦'],['scr','Screener','⌕'],['mkt','Markets','≋'],['wl','Watchlist','★']];
-var maxVol=1,msort='volume';
+var maxVol=1,msort='volume',mlim=50;
 var tab='dash',ctl=null,rows=[],viewing=null,wl=[];
 try{wl=JSON.parse(localStorage.getItem('wl')||'[]')}catch(e){}
 function saveWl(){try{localStorage.setItem('wl',JSON.stringify(wl))}catch(e){}}
@@ -353,7 +395,7 @@ function dash(){
     var by=function(k,dir,min){return r.filter(function(x){return min==null||(x[k]||0)>=min}).sort(function(a,b){return((a[k]||0)-(b[k]||0))*dir}).slice(0,4).map(row).join('')};
     var surge=by('relVolume',-1,1.5);
     setView('<div class="sum glass"><div><small>Advancing</small><b class="up">'+adv+'</b></div><div><small>Declining</small><b class="dn">'+dec+'</b></div><div><small>Total volume</small><b>'+vf(tot)+'</b></div></div><div class="split"><i style="width:'+pct+'%"></i></div>'+
-      '<h3>Top gainers</h3>'+by('percentChange',-1)+'<h3>Top losers</h3>'+by('percentChange',1)+'<h3>Most active by volume</h3>'+by('volume',-1)+(surge?'<h3>Volume surge (busier than usual)</h3>'+surge:'')+more(d));
+      '<p class="mut" style="text-align:center;margin:-4px 0 6px">Tracking '+r.length+' stocks'+(d.index?' · '+esc(d.index):'')+'</p><h3>Top gainers</h3>'+by('percentChange',-1)+'<h3>Top losers</h3>'+by('percentChange',1)+'<h3>Most active by volume</h3>'+by('volume',-1)+(surge?'<h3>Volume surge (busier than usual)</h3>'+surge:'')+more(d));
   }).catch(function(e){if(!isAbort(e))setView(errBox(e,'dash'))});
 }
 function mkt(){
@@ -364,10 +406,12 @@ function mkt(){
     sc.innerHTML=SORTS.map(function(x){return'<button data-k="'+x[0]+'" class="'+(msort===x[0]?'on':'')+'">'+x[1]+'</button>'}).join('');
     var list=rows.filter(function(x){return(x.symbol+' '+(x.companyName||'')).toLowerCase().indexOf(q)>-1});
     list.sort(function(a,b){return msort==='symbol'?a.symbol.localeCompare(b.symbol):(b[msort]||0)-(a[msort]||0)});
-    var h=list.map(row).join('');
-    l.innerHTML=(h||(!rows.length&&lastD?waiting(lastD,'mkt'):'<p class="mut">No matches.</p>'))+more(lastD)};
+    var cap=q?100:mlim,h=list.slice(0,cap).map(row).join('');
+    var btn=list.length>cap?'<button id="mo" style="width:100%;margin:4px 0 12px">Show more ('+(list.length-cap)+' left)</button>':'';
+    l.innerHTML=(h?'<p class="mut" style="margin:0 4px 8px">'+list.length+' stocks</p>':'')+(h||(!rows.length&&lastD?waiting(lastD,'mkt'):'<p class="mut">No matches.</p>'))+btn+more(lastD)};
   var f=$('#f'),sc=$('#sc');if(f)f.oninput=function(){draw()};
-  if(sc)sc.onclick=function(e){var b=e.target.closest('button');if(b){msort=b.dataset.k;draw()}};
+  if(sc)sc.onclick=function(e){var b=e.target.closest('button');if(b){msort=b.dataset.k;mlim=50;draw()}};
+  var lst=$('#list');if(lst)lst.onclick=function(e){if(e.target.closest&&e.target.closest('#mo')){mlim+=50;draw()}};
   poll(newSignal(),function(d){if(tab==='mkt')draw(d)}).catch(function(e){var l=$('#list');if(l&&!isAbort(e))l.innerHTML=errBox(e,'mkt')});
 }
 function wlv(){
@@ -391,7 +435,7 @@ function scr(){
       i.filters.forEach(function(f){chips+='<span class="chip">'+esc(f.field)+' '+esc(f.op)+' '+n(f.value)+'</span>'});
       if(i.sortBy)chips+='<span class="chip">sort: '+esc(i.sortBy)+' '+i.sortDir+'</span>';
       var un=i.unsupported.length?'<p class="mut" style="margin:6px 0">Not available in this app: '+esc(i.unsupported.join(', '))+'</p>':'';
-      o.innerHTML='<div>'+chips+'</div>'+un+'<h3>'+d.matches+' match(es)</h3>'+(d.results.map(row).join('')||'<p class="mut">Nothing matched.</p>');
+      o.innerHTML='<div>'+chips+'</div>'+un+'<h3>'+d.matches+' match(es)'+(d.matches>d.results.length?' · showing top '+d.results.length:'')+'</h3>'+(d.results.map(row).join('')||'<p class="mut">Nothing matched.</p>');
       rows=d.results.length?rows:rows;
     }).catch(function(e){var o=$('#out');if(o&&!isAbort(e))o.innerHTML='<div class="err glass">'+esc(e.message)+'</div>'});
   };
