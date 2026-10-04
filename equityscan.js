@@ -466,7 +466,7 @@ app.get("/api/debug/raw", h(async (q) => {
 }));
 app.get("/api/market-status", h(marketStatus));
 app.get("/api/stocks", h(async () => {
-  refreshStale(); refreshYahoo(); refreshBhav();
+  refreshStale(); refreshYahoo(); refreshBhav(); maybeRecord();
   const rows = have(), mix = { NSE: 0, Yahoo: 0, EOD: 0 };
   rows.forEach((r) => { mix[r.via]++; });
   return {
@@ -485,6 +485,52 @@ app.get("/api/stock/:symbol", h(async (q) => {
   if (y) { getStock(sym).catch(() => {}); return { ...y, source: "cache", via: "Yahoo" }; }
   return getStock(sym);
 }));
+/* ---------- SELF-RECORDED HISTORY: the app saves its own price snapshots so charts work without NSE/Yahoo ---------- */
+const HIST_FILE = path.join(__dirname, ".history.json");
+const hist = new Map();
+let histDirty = false, lastRec = 0;
+const istYmd = (t) => new Date(t + 19800000).toISOString().slice(0, 10);
+function loadHist() {
+  try { const o = JSON.parse(fs.readFileSync(HIST_FILE, "utf8")); for (const [k, v] of Object.entries(o)) if (v && Array.isArray(v.i) && Array.isArray(v.d)) hist.set(k, v); } catch (e) {}
+}
+function saveHist() {
+  if (!histDirty) return;
+  try { fs.writeFileSync(HIST_FILE, JSON.stringify(Object.fromEntries(hist))); histDirty = false; } catch (e) { console.warn("[EquityScan] could not save history:", e.message); }
+}
+function maybeRecord() {
+  const now = Date.now();
+  if (now - lastRec < 120000) return;
+  lastRec = now;
+  for (const r of have()) {
+    if (r.currentPrice == null) continue;
+    let h = hist.get(r.symbol); if (!h) hist.set(r.symbol, h = { i: [], d: [] });
+    const t = r.via === "EOD" ? Date.parse(r.lastUpdated) : now, day = Number.isFinite(t) ? istYmd(t) : null;
+    if (day) {
+      const rec = [day, r.currentPrice, r.volume || 0], last = h.d[h.d.length - 1];
+      if (last && last[0] === day) h.d[h.d.length - 1] = rec; else if (!last || day > last[0]) h.d.push(rec);
+      if (h.d.length > 260) h.d.shift();
+    }
+    if (r.via !== "EOD") {
+      const last = h.i[h.i.length - 1];
+      if (!last || (now - last[0] >= 180000 && (last[1] !== r.currentPrice || now - last[0] >= 600000))) {
+        h.i.push([now, r.currentPrice, r.volume || 0]);
+        if (h.i.length > 150) h.i.shift();
+      }
+    }
+  }
+  histDirty = true;
+}
+function ownChart(sym, range) {
+  const h = hist.get(sym); if (!h) return [];
+  if (range === "1d") {
+    if (!h.i.length) return [];
+    const day = istYmd(h.i[h.i.length - 1][0]);
+    return h.i.filter((p) => istYmd(p[0]) === day).map((p) => [p[0] + 19800000, p[1]]);
+  }
+  const cut = istYmd(Date.now() - { "1m": 31, "6m": 183, "1y": 366 }[range] * 864e5);
+  return h.d.filter((p) => p[0] >= cut).map((p) => [Date.parse(p[0] + "T00:00:00Z"), p[1], p[2]]);
+}
+
 app.get("/api/chart/:symbol", h(async (q) => {
   const sym = String(q.params.symbol || "").trim().toUpperCase();
   if (!/^[A-Z0-9&-]{1,20}$/.test(sym)) throw fail("INVALID_SYMBOL", '"' + sym + '" is not a valid NSE symbol.', 400);
@@ -514,11 +560,19 @@ app.get("/api/chart/:symbol", h(async (q) => {
     })();
     const viaYahoo = yahooChart(sym, range);
     viaNse.catch(() => {}); viaYahoo.catch(() => {});
-    try { pts = await Promise.any([viaNse, viaYahoo]); }
+    maybeRecord();
+    const mine = ownChart(sym, range);
+    const viaOwn = new Promise((res, rej) => setTimeout(() => (mine.length >= 6 ? res(["own", mine]) : rej(new Error("no recorded history yet"))), 1500));
+    viaOwn.catch(() => {});
+    let src;
+    try { [src, pts] = await Promise.any([viaNse.then((x) => ["NSE", x]), viaYahoo.then((x) => ["Yahoo", x]), viaOwn]); }
     catch (e) {
       const old = stale(k); if (old) return old;
-      const first = e && e.errors && e.errors[0];
-      throw first && first.code ? first : fail("PROVIDER_UNAVAILABLE", "Chart data unavailable: " + String((first && first.message) || e).slice(0, 120), 503);
+      if (mine.length >= 2) { src = "own"; pts = mine; }
+      else {
+        const first = e && e.errors && e.errors[0];
+        throw first && first.code ? first : fail("PROVIDER_UNAVAILABLE", "Chart data unavailable: " + String((first && first.message) || e).slice(0, 120) + ". The app is recording prices, so charts will fill in over time.", 503);
+      }
     }
     if (pts.length > 120) {
       const step = Math.ceil(pts.length / 120), out = [];
@@ -528,8 +582,8 @@ app.get("/api/chart/:symbol", h(async (q) => {
       }
       pts = out;
     }
-    nseBudget.spend();
-    return cset(k, { symbol: sym, range, points: pts }, range === "1d" ? 120000 : 6 * 3600000);
+    if (src === "NSE") nseBudget.spend();
+    return cset(k, { symbol: sym, range, src, points: pts }, src === "own" ? 60000 : range === "1d" ? 120000 : 6 * 3600000);
   });
 }));
 app.post("/api/query", h(async (q) => {
@@ -657,6 +711,8 @@ h3{letter-spacing:.3px;text-transform:uppercase;font-size:12px}
 .ai{padding:12px 14px;margin-bottom:12px;background:linear-gradient(135deg,rgba(46,230,166,.14),rgba(31,182,201,.08));border-color:rgba(46,230,166,.3)}
 .aih{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}.aih button{padding:5px 12px;font-size:12px}
 .aio{font-size:14px;line-height:1.55}
+.mb{display:grid;grid-template-columns:104px 1fr 96px;gap:8px;align-items:center;font-size:11px;margin-top:6px}.mb span{color:var(--m)}.mb em{font-style:normal;text-align:right;color:var(--m)}
+.mt{height:6px;border-radius:9px;background:rgba(255,255,255,.1);overflow:hidden}.mt i{display:block;height:100%}
 </style></head><body>
 <div id="app">
 <header class="glass"><div><b>EquityScan</b><small id="up">MARKET INTELLIGENCE</small></div><span id="mk">Checking…</span></header>
@@ -719,6 +775,27 @@ function runExplain(sym){
   var o=$('#exo'),b=$('#exb');if(o)o.innerHTML='<span class="mut">Thinking…</span>';if(b)b.disabled=true;
   api('/api/explain',{symbol:sym}).then(function(d){showLines('#exo',d.text);var b2=$('#exb');if(b2){b2.disabled=false;b2.textContent='Refresh'}})
     .catch(function(e){var o2=$('#exo'),b2=$('#exb');if(o2)o2.innerHTML='<span class="mut">'+esc(e.message)+'</span>';if(b2)b2.disabled=false})}
+function moodScore(r){
+  var up=0,dn=0,sum=0,cnt=0,hi=0,hc=0,vu=0,vt=0;
+  r.forEach(function(x){var p=x.percentChange;if(p==null)return;cnt++;sum+=p;if(p>0)up++;else if(p<0)dn++;
+    if(x.highPercent!=null){hc++;if(x.highPercent>=90)hi++}
+    var v=x.volume||0;vt+=v;if(p>0)vu+=v});
+  if(cnt<5)return null;
+  var parts=[{k:'Breadth',w:40,v:up+dn?up/(up+dn)*100:50,t:up+' up · '+dn+' down'},
+    {k:'Momentum',w:30,v:Math.max(0,Math.min(100,50+sum/cnt*15)),t:'avg '+(sum/cnt>=0?'+':'')+(sum/cnt).toFixed(2)+'%'}];
+  if(vt>0)parts.push({k:'Volume on gainers',w:15,v:vu/vt*100,t:Math.round(vu/vt*100)+'% of volume'});
+  if(hc>=5)parts.push({k:'Near 52-week high',w:15,v:Math.min(100,hi/hc*300),t:hi+' of '+hc+' within 10%'});
+  var W=parts.reduce(function(a,p){return a+p.w},0);
+  return{score:Math.round(parts.reduce(function(a,p){return a+p.v*p.w},0)/W),parts:parts};
+}
+function moodHtml(r){
+  var m=moodScore(r);if(!m)return'';
+  var s=m.score,lab=s<20?'Extreme fear':s<40?'Fear':s<60?'Neutral':s<80?'Greed':'Extreme greed',col=s<40?'#ff6b81':s<60?'#ffd166':'#2ee6a6';
+  var bars=m.parts.map(function(p){return'<div class="mb"><span>'+p.k+'</span><div class="mt"><i style="width:'+Math.round(p.v)+'%;background:'+(p.v<40?'#ff6b81':p.v<60?'#ffd166':'#2ee6a6')+'"></i></div><em>'+esc(p.t)+'</em></div>'}).join('');
+  return'<div class="ai glass"><div class="aih">◔ Market mood</div><svg viewBox="0 0 200 116" width="100%" style="max-width:260px;display:block;margin:0 auto"><defs><linearGradient id="mg" x1="0" x2="1" y1="0" y2="0"><stop offset="0" stop-color="#ff6b81"/><stop offset=".5" stop-color="#ffd166"/><stop offset="1" stop-color="#2ee6a6"/></linearGradient></defs><path d="M20 100 A80 80 0 0 1 180 100" fill="none" stroke="rgba(255,255,255,.1)" stroke-width="16" stroke-linecap="round"/><path d="M20 100 A80 80 0 0 1 180 100" fill="none" stroke="url(#mg)" stroke-width="16" stroke-linecap="round"/><line x1="100" y1="100" x2="100" y2="36" stroke="#fff" stroke-width="3" stroke-linecap="round" transform="rotate('+(-90+s*1.8)+' 100 100)"/><circle cx="100" cy="100" r="6" fill="#fff"/></svg>'+
+    '<div style="text-align:center;margin-top:-2px"><b style="font-size:30px;color:'+col+'">'+s+'</b> <span style="font-size:15px">'+lab+'</span></div>'+bars+
+    '<small>Built from today’s breadth, momentum, volume on gainers and stocks near 52-week highs. Not a prediction or advice.</small></div>';
+}
 function dash(){
   setView(skel());var sig=newSignal();
   poll(sig,function(d){
@@ -731,7 +808,7 @@ function dash(){
     var tag='Tracking '+r.length+' stocks'+(d.index?' · '+esc(d.index):'')+(d.mix?' · '+Object.keys(d.mix).filter(function(k){return d.mix[k]}).map(function(k){return k+' '+d.mix[k]}).join(' + '):'');
     var warn=function(t,m){return m?'<p class="mut" style="text-align:center;margin:0 0 8px">'+t+' ('+esc(m)+')</p>':''};
     var surge=top('relVolume',-1,1.5).slice(0,4).map(row).join('');
-    setView(aiCard()+'<div class="sum glass"><div><small>Advancing</small><b class="up">'+adv+'</b></div><div><small>Declining</small><b class="dn">'+dec+'</b></div><div><small>Total volume</small><b>'+vf(tot)+'</b></div></div><div class="split"><i style="width:'+pct+'%"></i></div>'+
+    setView(aiCard()+moodHtml(r)+'<div class="sum glass"><div><small>Advancing</small><b class="up">'+adv+'</b></div><div><small>Declining</small><b class="dn">'+dec+'</b></div><div><small>Total volume</small><b>'+vf(tot)+'</b></div></div><div class="split"><i style="width:'+pct+'%"></i></div>'+
       '<p class="mut" style="text-align:center;margin:-4px 0 6px">'+tag+'</p>'+warn('Full list unavailable',d.indexError)+warn('Yahoo unavailable',d.yahooError)+warn('End-of-day list unavailable',d.bhavError)+
       '<h3>Top gainers</h3><div class="hs">'+top('percentChange',-1).slice(0,10).map(mc).join('')+'</div>'+
       '<h3>Top losers</h3><div class="hs">'+top('percentChange',1).slice(0,10).map(mc).join('')+'</div>'+
@@ -819,7 +896,7 @@ function loadChart(sym){
     if(!d.points.length){c2.innerHTML='<p class="mut">No chart data for this range.</p>';return}
     var a=d.points[0][1],b=d.points[d.points.length-1][1];
     c2.innerHTML=chartSvg(d.points,b>=a);bindChart(d.points,crange);
-    if(v2)v2.textContent='Range change: '+(b>=a?'+':'')+((b-a)/a*100).toFixed(2)+'% · touch the chart to inspect';
+    if(v2)v2.textContent='Range change: '+(b>=a?'+':'')+((b-a)/a*100).toFixed(2)+'% · touch the chart to inspect'+(d.src==='own'?' · recorded by this app since '+fmtT(d.points[0][0],crange)+(d.points.length<15?' (fills in as it keeps running)':''):'');
   }).catch(function(e){var c3=$('#ch');if(c3&&!isAbort(e))c3.innerHTML='<p class="mut">Chart unavailable: '+esc(e.message)+'</p>'});
 }
 /* detail */
@@ -876,5 +953,7 @@ app.listen(C.port, () => {
       if (m.status !== "CLOSED" || !have().length) { refreshStale(); refreshYahoo(); refreshBhav(); }
     } catch (e) {}
   };
-  warm(); setInterval(warm, C.refresh);
+  loadHist(); warm(); setInterval(warm, C.refresh);
+  setInterval(maybeRecord, 120000); setInterval(saveHist, 15 * 60000);
+  process.on("SIGTERM", () => { saveHist(); process.exit(0); });
 });
