@@ -545,6 +545,47 @@ app.post("/api/chat", h(async (q) => {
   const sys = "You are the EquityScan assistant. Answer ONLY from the CONTEXT JSON (the stocks, watchlist and stock currently shown in the app). If the answer is not in it, say you don't have that. Be brief (max 3 sentences). NEVER give buy/sell/hold advice or price predictions; if asked, politely decline.\nCONTEXT: " + ctx;
   return cset(k, { reply: await groq([{ role: "system", content: sys }, { role: "user", content: m }], 700) }, 60000);
 }));
+/* ---------- AI: market brief + per-stock explainer (grounded in loaded data, no advice) ---------- */
+const NOADV = "Use ONLY the JSON data given. Plain simple English. Never give buy/sell/hold advice, price targets or predictions. No markdown symbols like ** or #.";
+const pctOf = (r) => r.percentChange;
+const slim = (r) => ({ symbol: r.symbol, name: r.companyName, price: r.currentPrice, changePct: r.percentChange, volumeVsTypical: r.relVolume });
+app.post("/api/brief", h(async () => {
+  const rows = have().filter((r) => pctOf(r) != null);
+  if (rows.length < 5) throw fail("NOT_READY", "Market data is still loading. Try again in a moment.", 503);
+  const k = "brief:" + Math.floor(Date.now() / 600000) + ":" + Math.floor(rows.length / 10), hit = cget(k);
+  if (hit) return hit;
+  const ctx = {
+    stocksTracked: rows.length, advancing: rows.filter((r) => pctOf(r) > 0).length, declining: rows.filter((r) => pctOf(r) < 0).length,
+    topGainers: rows.slice().sort((a, b) => pctOf(b) - pctOf(a)).slice(0, 5).map(slim),
+    topLosers: rows.slice().sort((a, b) => pctOf(a) - pctOf(b)).slice(0, 5).map(slim),
+    unusuallyBusy: rows.filter((r) => r.relVolume >= 2).sort((a, b) => b.relVolume - a.relVolume).slice(0, 5).map(slim),
+    nearFiftyTwoWeekHigh: rows.filter((r) => r.highPercent >= 97).length,
+  };
+  const text = await groq([
+    { role: "system", content: "You write a short end-of-session style market brief for Indian stocks. Write 4 to 5 short lines, each starting with the bullet character •. First line: overall mood (advancers vs decliners). Then notable movers, then unusual volume if any. " + NOADV },
+    { role: "user", content: JSON.stringify(ctx) },
+  ], 1000);
+  return cset(k, { text, asOf: new Date().toISOString(), stocks: rows.length }, 600000);
+}));
+app.post("/api/explain", h(async (q) => {
+  const sym = String((q.body && q.body.symbol) || "").trim().toUpperCase();
+  if (!/^[A-Z0-9&-]{1,20}$/.test(sym)) throw fail("INVALID_SYMBOL", "Invalid symbol.", 400);
+  const rows = have(), r = rows.find((x) => x.symbol === sym);
+  if (!r) throw fail("NOT_FOUND", "No data loaded for " + sym + " yet.", 404);
+  const k = "ex:" + sym + ":" + Math.floor(Date.now() / 600000), hit = cget(k);
+  if (hit) return hit;
+  const pcts = rows.map(pctOf).filter((v) => v != null).sort((a, b) => a - b);
+  const ctx = {
+    stock: { symbol: r.symbol, name: r.companyName, sector: r.sector, price: r.currentPrice, changePct: r.percentChange, volumeVsTypical: r.relVolume, percentOf52WeekHigh: r.highPercent, week52Low: r.week52Low, week52High: r.week52High, marketCap: r.marketCap, pe: r.pe },
+    market: { stocksTracked: rows.length, advancing: rows.filter((x) => pctOf(x) > 0).length, declining: rows.filter((x) => pctOf(x) < 0).length, medianChangePct: pcts.length ? pcts[Math.floor(pcts.length / 2)] : null },
+    beatPercentOfStocksToday: pcts.length && pctOf(r) != null ? Math.round((pcts.filter((v) => v < pctOf(r)).length / pcts.length) * 100) : null,
+  };
+  const text = await groq([
+    { role: "system", content: "In 3 short sentences explain what stands out about this stock today versus the market: its move, trading volume, and where it sits in its 52-week range (skip anything that is null). " + NOADV },
+    { role: "user", content: JSON.stringify(ctx) },
+  ], 900);
+  return cset(k, { text, symbol: sym }, 600000);
+}));
 app.get("/", (q, r) => r.type("html").send(HTML));
 
 /* ---------- FRONTEND (Liquid Glass) ---------- */
@@ -613,6 +654,9 @@ body{font-variant-numeric:tabular-nums}
 #modal .box{max-height:90vh;overflow-y:auto}
 #tabs button.on{color:var(--g)}
 h3{letter-spacing:.3px;text-transform:uppercase;font-size:12px}
+.ai{padding:12px 14px;margin-bottom:12px;background:linear-gradient(135deg,rgba(46,230,166,.14),rgba(31,182,201,.08));border-color:rgba(46,230,166,.3)}
+.aih{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}.aih button{padding:5px 12px;font-size:12px}
+.aio{font-size:14px;line-height:1.55}
 </style></head><body>
 <div id="app">
 <header class="glass"><div><b>EquityScan</b><small id="up">MARKET INTELLIGENCE</small></div><span id="mk">Checking…</span></header>
@@ -626,7 +670,7 @@ h3{letter-spacing:.3px;text-transform:uppercase;font-size:12px}
 <script>
 var $=function(s){return document.querySelector(s)};
 var TABS=[['dash','Dashboard','▦'],['scr','Screener','⌕'],['mkt','Markets','≋'],['wl','Watchlist','★']];
-var maxVol=1,msort='volume',mlim=50;
+var maxVol=1,msort='volume',mlim=50,briefHtml='',briefTried=false;
 var tab='dash',ctl=null,rows=[],viewing=null,wl=[];
 try{wl=JSON.parse(localStorage.getItem('wl')||'[]')}catch(e){}
 function saveWl(){try{localStorage.setItem('wl',JSON.stringify(wl))}catch(e){}}
@@ -664,18 +708,30 @@ function poll(sig,render,tries){
 }
 function more(d){return d&&d.loading>0&&d.rows.length?'<p class="mut" style="text-align:center">Loading '+d.loading+' more…</p>':''}
 function waiting(d,retry){return d.error?errBox(new Error('NSE is not responding ('+(d.error.status||d.error.message)+'). Retrying…'),retry):skel()}
+function aiCard(){return'<div class="ai glass"><div class="aih"><b>✦ AI Market Brief</b><button id="aib">'+(briefHtml?'Refresh':'Generate')+'</button></div><div class="aio" id="aio">'+(briefHtml||'<span class="mut">Tap Generate for a plain-English summary of today’s market.</span>')+'</div></div>'}
+function showLines(id,text,done){var L=String(text).replace(/\*\*/g,'').split('\n').map(function(x){return x.trim()}).filter(Boolean),i=0;
+  (function nx(){var o=$(id);if(!o)return;o.innerHTML=L.slice(0,++i).map(esc).join('<br>');if(i<L.length)setTimeout(nx,300);else if(done)done(L.map(esc).join('<br>'))})()}
+function runBrief(){
+  var o=$('#aio'),b=$('#aib');if(o)o.innerHTML='<span class="mut">Reading the market…</span>';if(b)b.disabled=true;
+  api('/api/brief',{}).then(function(d){showLines('#aio',d.text,function(h){briefHtml=h});var b2=$('#aib');if(b2){b2.disabled=false;b2.textContent='Refresh'}})
+    .catch(function(e){var o2=$('#aio'),b2=$('#aib');if(o2)o2.innerHTML='<span class="mut">'+esc(e.message)+'</span>';if(b2)b2.disabled=false})}
+function runExplain(sym){
+  var o=$('#exo'),b=$('#exb');if(o)o.innerHTML='<span class="mut">Thinking…</span>';if(b)b.disabled=true;
+  api('/api/explain',{symbol:sym}).then(function(d){showLines('#exo',d.text);var b2=$('#exb');if(b2){b2.disabled=false;b2.textContent='Refresh'}})
+    .catch(function(e){var o2=$('#exo'),b2=$('#exb');if(o2)o2.innerHTML='<span class="mut">'+esc(e.message)+'</span>';if(b2)b2.disabled=false})}
 function dash(){
   setView(skel());var sig=newSignal();
   poll(sig,function(d){
     if(tab!=='dash')return;var r=d.rows;
     if(!r.length){setView(waiting(d,'dash'));return}
+    if(!briefTried&&r.length>=5){briefTried=true;setTimeout(runBrief,0)}
     var adv=0,dec=0,tot=0;r.forEach(function(x){if(x.percentChange>0)adv++;else if(x.percentChange<0)dec++;tot+=x.volume||0});
     var pct=adv+dec?adv/(adv+dec)*100:50;
     var top=function(k,dir,min){return r.filter(function(x){return x[k]!=null&&(min==null||x[k]>=min)}).sort(function(a,b){return(a[k]-b[k])*dir})};
     var tag='Tracking '+r.length+' stocks'+(d.index?' · '+esc(d.index):'')+(d.mix?' · '+Object.keys(d.mix).filter(function(k){return d.mix[k]}).map(function(k){return k+' '+d.mix[k]}).join(' + '):'');
     var warn=function(t,m){return m?'<p class="mut" style="text-align:center;margin:0 0 8px">'+t+' ('+esc(m)+')</p>':''};
     var surge=top('relVolume',-1,1.5).slice(0,4).map(row).join('');
-    setView('<div class="sum glass"><div><small>Advancing</small><b class="up">'+adv+'</b></div><div><small>Declining</small><b class="dn">'+dec+'</b></div><div><small>Total volume</small><b>'+vf(tot)+'</b></div></div><div class="split"><i style="width:'+pct+'%"></i></div>'+
+    setView(aiCard()+'<div class="sum glass"><div><small>Advancing</small><b class="up">'+adv+'</b></div><div><small>Declining</small><b class="dn">'+dec+'</b></div><div><small>Total volume</small><b>'+vf(tot)+'</b></div></div><div class="split"><i style="width:'+pct+'%"></i></div>'+
       '<p class="mut" style="text-align:center;margin:-4px 0 6px">'+tag+'</p>'+warn('Full list unavailable',d.indexError)+warn('Yahoo unavailable',d.yahooError)+warn('End-of-day list unavailable',d.bhavError)+
       '<h3>Top gainers</h3><div class="hs">'+top('percentChange',-1).slice(0,10).map(mc).join('')+'</div>'+
       '<h3>Top losers</h3><div class="hs">'+top('percentChange',1).slice(0,10).map(mc).join('')+'</div>'+
@@ -779,7 +835,7 @@ function openDetail(sym){
     var pos=s.week52High&&s.week52Low&&s.week52High>s.week52Low?Math.max(0,Math.min(100,(s.currentPrice-s.week52Low)/(s.week52High-s.week52Low)*100)):null;
     b.innerHTML='<div class="sh"><div><b style="font-size:22px">'+esc(s.symbol)+'</b><div class="mut">'+esc(s.companyName||'')+(s.via&&s.via!=='NSE'?' · '+esc(s.via):'')+'</div></div><div><span class="star'+(on?' on':'')+'" data-w="'+esc(s.symbol)+'">★</span> <button id="x">✕</button></div></div>'+
       '<div class="big">₹'+n(s.currentPrice)+'</div><span class="pill '+(up?'up':'dn')+'">'+(up?'+':'')+n(s.change)+' ('+n(s.percentChange)+'%)</span>'+
-      '<div class="chips" id="rg" style="margin-top:14px"></div><div id="ch" style="min-height:130px"></div><div id="cv" class="mut" style="font-size:12px;min-height:16px;margin-bottom:4px"></div>'+
+      '<div class="ai glass" style="margin-top:14px"><div class="aih"><b>✦ AI take</b><button id="exb" data-s="'+esc(s.symbol)+'">Explain</button></div><div class="aio" id="exo"><span class="mut">What stands out about this stock today?</span></div></div><div class="chips" id="rg"></div><div id="ch" style="min-height:130px"></div><div id="cv" class="mut" style="font-size:12px;min-height:16px;margin-bottom:4px"></div>'+
       '<div class="grid2">'+st('Open',money(s.open))+st('Prev close',money(s.previousClose))+st('Day high',money(s.dayHigh))+st('Day low',money(s.dayLow))+st('52W high',money(s.week52High))+st('52W low',money(s.week52Low))+
         (rr.marketCap?st('Market cap','₹'+mcf(rr.marketCap)):'')+(rr.pe?st('P/E',n(rr.pe)):'')+'</div>'+
       (pos!=null?'<div class="mut">52-week range</div><div class="bar"><i style="left:'+pos+'%"></i></div>':'')+
@@ -805,7 +861,7 @@ function chatInit(){
 }
 
 /* boot */
-document.addEventListener('click',function(e){var t=e.target;if(!t.closest)return;var st=t.closest('.star');if(st){toggleWl(st.dataset.w);return}var r=t.closest('.row,.mc');if(r&&r.dataset.s)openDetail(r.dataset.s)});
+document.addEventListener('click',function(e){var t=e.target;if(!t.closest)return;var st=t.closest('.star');if(st){toggleWl(st.dataset.w);return}if(t.closest('#aib')){runBrief();return}var eb=t.closest('#exb');if(eb){runExplain(eb.dataset.s);return}var r=t.closest('.row,.mc');if(r&&r.dataset.s)openDetail(r.dataset.s)});
 var mdl=$('#modal');if(mdl)mdl.onclick=function(e){if(e.target===mdl)closeDetail()};
 function market(){api('/api/market-status').then(function(d){var m=$('#mk');if(m){m.textContent='Market '+(d.status==='OPEN'?'Open':d.status==='CLOSED'?'Closed':'—');m.className=d.status==='OPEN'?'up':''}}).catch(function(){var m=$('#mk');if(m)m.textContent='Market —'})}
 drawTabs();chatInit();market();setInterval(market,60000);go('dash');
